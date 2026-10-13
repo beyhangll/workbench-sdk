@@ -1,0 +1,83 @@
+name: AQ evaluation
+description: Evaluate a connected AgentCore branch endpoint and publish its aggregate regression report.
+inputs:
+  endpoint:
+    description: Trusted HTTPS evaluation API address.
+    required: true
+  api-key:
+    description: Evaluation key from a protected secret store.
+    required: true
+  target:
+    description: Connected non-production AgentCore agent name or ID.
+    required: true
+  dataset:
+    description: Existing development dataset name or ID.
+    required: true
+  agent-endpoint:
+    description: Endpoint on the connected runtime deployed by the customer pipeline.
+    required: true
+  commit:
+    description: Full tested PR head SHA. This declaration is not deployment attestation.
+    required: true
+  budget:
+    description: Required metered USD budget, subject to existing server limits.
+    required: true
+  github-token:
+    description: Separate repository comment token from protected trusted context.
+    required: true
+  publisher-id:
+    description: Trusted configured account or bot identity for that token, never the workflow actor or an artifact field.
+    required: true
+  check-key:
+    description: Stable agent.dataset comment key and caller concurrency key.
+    required: true
+  ui-url:
+    description: Optional trusted evaluation UI address.
+    default: ''
+  timeout:
+    description: Existing CLI scoring wait deadline in seconds, from 1 through 3600.
+    default: '1800'
+  reconcile-report:
+    description: Retained aggregate-result.json for read-only reconciliation. Skips evaluation and cannot write comments.
+    default: ''
+outputs:
+  evaluation-exit-code:
+    description: Original evaluation exit, separate from publication.
+    value: ${{ steps.evaluate.outputs.evaluation-exit-code }}
+  publication-status:
+    description: Confirmed or unconfirmed comment publication status.
+    value: ${{ steps.evaluate.outputs.publication-status }}
+  report-dir:
+    description: Aggregate-only reports. Never upload the sibling private directory.
+    value: ${{ steps.evaluate.outputs.report-dir }}
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+      with:
+        python-version: '3.12'
+    - id: install
+      shell: bash
+      env:
+        AQ_ACTION_PATH: ${{ github.action_path }}
+        AQ_ACTION_REF: ${{ github.action_ref }}
+      run: python -I "$AQ_ACTION_PATH/install.py"
+    - id: evaluate
+      shell: bash
+      env:
+        AQ_ACTION_PATH: ${{ github.action_path }}
+        AQ_ACTION_PYTHON: ${{ steps.install.outputs.python }}
+        AQ_ENDPOINT: ${{ inputs.endpoint }}
+        AQ_API_KEY: ${{ inputs.api-key }}
+        AQ_UI_URL: ${{ inputs.ui-url }}
+        AQ_CI_TARGET: ${{ inputs.target }}
+        AQ_CI_DATASET: ${{ inputs.dataset }}
+        AQ_CI_AGENT_ENDPOINT: ${{ inputs.agent-endpoint }}
+        AQ_CI_COMMIT: ${{ inputs.commit }}
+        AQ_CI_BUDGET: ${{ inputs.budget }}
+        AQ_CI_GITHUB_TOKEN: ${{ inputs.github-token }}
+        AQ_CI_PUBLISHER_ID: ${{ inputs.publisher-id }}
+        AQ_CI_CHECK_KEY: ${{ inputs.check-key }}
+        AQ_CI_TIMEOUT: ${{ inputs.timeout }}
+        AQ_CI_RECONCILE_REPORT: ${{ inputs.reconcile-report }}
+      run: '"$AQ_ACTION_PYTHON" -I "$AQ_ACTION_PATH/run.py"'

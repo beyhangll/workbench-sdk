@@ -1,0 +1,92 @@
+# Customer template. Use an owner-controlled CI configuration, not MR branch code.
+# The pinned customer job deploys remotely without AQ credentials and emits dotenv
+# AQ_TEST_ENDPOINT=mr_<MR IID>_<pipeline ID> and AQ_TESTED_COMMIT=<CI_COMMIT_SHA>.
+include:
+  - project: customer/trusted-agent-ci
+    ref: CUSTOMER_REVIEWED_CI_COMMIT
+    file: /deploy-test-endpoint.yml
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_EVENT_TYPE == "detached" && $CI_MERGE_REQUEST_SOURCE_PROJECT_ID == $CI_PROJECT_ID && $CI_MERGE_REQUEST_TARGET_PROJECT_ID == $CI_PROJECT_ID && $CI_MERGE_REQUEST_SOURCE_BRANCH_PROTECTED == "true" && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED == "true"'
+    - when: never
+variables:
+  AQ_SDK_REVISION: REVIEWED_SDK_COMMIT
+stages: [deploy, evaluate]
+evaluate-agent:
+  stage: evaluate
+  needs: [{job: deploy-test-endpoint, artifacts: true}]
+  image: python:3.12-slim
+  environment: agent-pr-evaluation
+  variables:
+    GIT_STRATEGY: none
+  resource_group: agent-evaluation-$CI_PROJECT_ID-$CI_MERGE_REQUEST_IID
+  retry: 0
+  script:
+    - |
+      set -eu
+      umask 077
+      rm -f -- "${CI_PROJECT_DIR:?}/evaluation.md"
+      aq_ci_workdir="$(mktemp -d)"
+      cd "$aq_ci_workdir"
+      python -I - <<'PY'
+      import os, re
+      e = os.environ
+      if not re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', e.get('AQ_SDK_REVISION', '')):
+          raise SystemExit('Configure a protected, reviewed SDK commit.')
+      if (e.get('CI_PIPELINE_SOURCE') != 'merge_request_event' or e.get('CI_MERGE_REQUEST_EVENT_TYPE') != 'detached'
+          or any(e.get(k) != e.get('CI_PROJECT_ID') for k in ('CI_MERGE_REQUEST_SOURCE_PROJECT_ID', 'CI_MERGE_REQUEST_TARGET_PROJECT_ID'))
+          or any(e.get(k) != 'true' for k in ('CI_MERGE_REQUEST_SOURCE_BRANCH_PROTECTED', 'CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED'))
+          or not re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', e.get('CI_COMMIT_SHA', ''))
+          or e.get('AQ_TESTED_COMMIT') != e['CI_COMMIT_SHA']
+          or not all(re.fullmatch(r'[1-9][0-9]*', e.get(k, '')) for k in ('CI_PROJECT_ID', 'CI_MERGE_REQUEST_IID', 'CI_PIPELINE_ID'))
+          or e.get('AQ_TEST_ENDPOINT') != 'mr_' + e['CI_MERGE_REQUEST_IID'] + '_' + e['CI_PIPELINE_ID']):
+          raise SystemExit('Trusted MR deployment did not confirm an isolated endpoint and exact commit.')
+      PY
+      apt-get update -qq
+      apt-get install -y -qq git
+      python -I -m pip --isolated install --quiet "git+https://github.com/beyhangll/workbench-sdk.git@${AQ_SDK_REVISION}#subdirectory=packages/aq-sdk"
+      python -I - <<'PY'
+      import html, json, os, subprocess, sys
+      from pathlib import Path
+      from urllib.parse import quote
+      from aq_sdk import report
+      private = Path('.private')
+      private.mkdir(mode=0o700)
+      args = [sys.executable, '-I', '-m', 'aq_sdk.cli', 'eval', 'run', '--dataset=' + os.environ['AQ_DATASET'], '--target=' + os.environ['AQ_AGENT'],
+              '--agent-endpoint=' + os.environ['AQ_TEST_ENDPOINT'], '--commit=' + os.environ['AQ_TESTED_COMMIT'],
+              '--compare-to=current', '--fail-on=regression', '--row-scope=development',
+              '--budget=' + os.environ['AQ_BUDGET_USD'], '--report-file=.private/evaluation.md', '--json']
+      env = {k: os.environ[k] for k in ('PATH', 'LANG', 'LC_ALL', 'AQ_API_KEY', 'AQ_ENDPOINT', 'AQ_UI_URL') if k in os.environ}
+      completed = subprocess.run(args, env=env, capture_output=True, text=True)
+      code, token = completed.returncode, os.environ['AQ_API_KEY']
+      variants = {token, report._markdown(token), report._markdown(report._markdown(token)), html.escape(token), quote(token, safe='')}
+      variants.update(json.dumps(v)[1:-1] for v in tuple(variants))
+      def scrub(text):
+          for value in sorted(variants, key=len, reverse=True):
+              if value: text = text.replace(value, '[credential removed]')
+          return text
+      saved = private / 'evaluation.md'
+      body = saved.read_text() if saved.exists() else ''
+      if saved.exists(): saved.write_text(scrub(body))
+      (private / 'result.redacted.json').write_text(scrub(completed.stdout))
+      (private / 'stderr.redacted.txt').write_text(scrub(completed.stderr))
+      try:
+          result = json.loads(completed.stdout)
+          expected, _ = report.outcome(result['experiment'], result.get('compare'), None, compare_wanted=True, fail_on='regression')
+          target = result['experiment']['target']
+          if (not token or type(result.get('exit_code')) is not int or result['exit_code'] != code or expected != code
+              or target.get('commit_sha') != os.environ['CI_COMMIT_SHA'] or target.get('agent_endpoint') != os.environ['AQ_TEST_ENDPOINT']
+              or target.get('endpoint_overridden') is not True or body != report.pr_summary(result)
+              or any(v and v in body for v in variants)):
+              raise ValueError
+          with (Path(os.environ['CI_PROJECT_DIR']) / 'evaluation.md').open('x') as f:
+              f.write(body)
+      except Exception:
+          print('No safe aggregate report is available. Inspect private records before retrying.')
+          raise SystemExit(code if code in (1, 2, 3) else 3)
+      raise SystemExit(code)
+      PY
+  artifacts:
+    when: always
+    paths: [evaluation.md]
+    expire_in: 7 days

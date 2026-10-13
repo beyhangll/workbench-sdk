@@ -1,0 +1,110 @@
+# Customer template. This is not a workflow for this repository.
+# Replace REVIEWED_ACTION_COMMIT with a reviewed, full SHA that contains the Action.
+name: AQ evaluation
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+permissions: {}
+concurrency:
+  group: aq-evaluation-${{ github.repository_id }}-${{ github.event.pull_request.number }}-${{ vars.AQ_CHECK_KEY }}
+  cancel-in-progress: false
+
+jobs:
+  deploy-test-endpoint:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    environment: agent-branch-deployment
+    permissions:
+      id-token: write
+    outputs:
+      endpoint: ${{ steps.deploy.outputs.endpoint }}
+      commit: ${{ steps.deploy.outputs.commit }}
+    steps:
+      # No PR checkout or execution on this credential-bearing runner.
+      # The customer owns this pre-approved isolated build/deployment project.
+      - uses: aws-actions/configure-aws-credentials@cabfdba3510de1431bac9dba27511d97497fc1001 # v5
+        with:
+          role-to-assume: ${{ secrets.BRANCH_BUILD_ROLE }}
+          aws-region: ${{ vars.AGENT_REGION }}
+          mask-aws-account-id: true
+          disable-retry: true
+      - id: deploy
+        shell: bash
+        env:
+          CUSTOMER_BUILD_PROJECT: ${{ vars.CUSTOMER_BRANCH_BUILD_PROJECT }}
+          PR_COMMIT: ${{ github.event.pull_request.head.sha }}
+          AWS_MAX_ATTEMPTS: '1'
+        run: |
+          python - <<'PY'
+          import json, os, re, subprocess, time
+          from pathlib import Path
+          sha = os.environ['PR_COMMIT']
+          if not re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', sha):
+              raise SystemExit('Invalid trusted PR commit.')
+          def aws(*args):
+              response = subprocess.run(['aws', 'codebuild', *args, '--output', 'json'], capture_output=True, text=True)
+              if response.returncode:
+                  raise SystemExit('Customer branch deployment is unconfirmed. Reconcile it before retrying.')
+              return json.loads(response.stdout)
+          started = aws('start-build', '--project-name', os.environ['CUSTOMER_BUILD_PROJECT'], '--source-version', sha,
+                        '--idempotency-token', os.environ['GITHUB_RUN_ID'] + '-' + os.environ['GITHUB_RUN_ATTEMPT'])
+          identifier = started['build']['id']
+          for _ in range(120):
+              build = aws('batch-get-builds', '--ids', identifier)['builds'][0]
+              if build['buildStatus'] != 'IN_PROGRESS':
+                  break
+              time.sleep(10)
+          else:
+              raise SystemExit('Customer deployment is still unresolved. No evaluation will start.')
+          if build['buildStatus'] != 'SUCCEEDED':
+              raise SystemExit('Customer branch deployment failed. No evaluation will start.')
+          exports = {v['name']: v['value'] for v in build.get('exportedEnvironmentVariables', [])}
+          endpoint = exports.get('AGENT_ENDPOINT', '')
+          if exports.get('DEPLOYED_COMMIT') != sha or not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{0,47}', endpoint):
+              raise SystemExit('Customer pipeline did not confirm the endpoint and commit.')
+          with Path(os.environ['GITHUB_OUTPUT']).open('a') as f:
+              f.write('endpoint=' + endpoint + '\n')
+              f.write('commit=' + sha + '\n')
+          PY
+
+  evaluate:
+    name: AQ evaluation
+    needs: deploy-test-endpoint
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    environment: agent-pr-evaluation
+    permissions:
+      contents: read
+    steps:
+      # No customer checkout, downloaded PR code, or build artifact enters this runner.
+      - id: evaluation
+        uses: beyhangll/workbench-sdk/.github/actions/evaluate@REVIEWED_ACTION_COMMIT
+        continue-on-error: true
+        with:
+          endpoint: ${{ vars.AQ_ENDPOINT }}
+          ui-url: ${{ vars.AQ_UI_URL }}
+          api-key: ${{ secrets.AQ_API_KEY }}
+          target: ${{ vars.AQ_AGENT }}
+          dataset: ${{ vars.AQ_DATASET }}
+          agent-endpoint: ${{ needs.deploy-test-endpoint.outputs.endpoint }}
+          commit: ${{ needs.deploy-test-endpoint.outputs.commit }}
+          budget: ${{ vars.AQ_BUDGET_USD }}
+          github-token: ${{ secrets.AQ_COMMENT_TOKEN }}
+          publisher-id: ${{ vars.AQ_COMMENT_PUBLISHER_ID }}
+          check-key: ${{ vars.AQ_CHECK_KEY }}
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always() && steps.evaluation.outputs.report-dir != ''
+        with:
+          name: evaluation-aggregate
+          # Only these allowlisted aggregate files. Never upload *-private or the workspace.
+          path: |
+            ${{ steps.evaluation.outputs.report-dir }}/evaluation.md
+            ${{ steps.evaluation.outputs.report-dir }}/aggregate-result.json
+            ${{ steps.evaluation.outputs.report-dir }}/publication.json
+          retention-days: 7
+          if-no-files-found: error
+      - name: Preserve evaluation and publication failure
+        if: always()
+        env:
+          STEP_OUTCOME: ${{ steps.evaluation.outcome }}
+        run: test "$STEP_OUTCOME" = success

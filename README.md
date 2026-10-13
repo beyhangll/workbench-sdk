@@ -7,7 +7,12 @@ Customer tracing and evaluation SDK, reusable AgentCore evaluation Action, and C
 - [GitHub customer workflow](docs/ci/github-agent-evaluation.yml)
 - [GitLab customer pipeline](docs/ci/gitlab-agent-evaluation.yml)
 
-Install from a checkout with `python -m pip install ./packages/aq-sdk`.
+Install from a checkout with `python -m pip install ./packages/aq-sdk`, or use
+the reviewed implementation pinned by the examples:
+
+```bash
+python -m pip install "git+https://github.com/beyhangll/workbench-sdk.git@7e35c68ab6d13c225da4e35f289c754439c60ff7#subdirectory=packages/aq-sdk"
+```
 The SDK requires Python 3.11 or newer. The Action uses Python 3.12 and requires
 a full reviewed commit SHA. CI evaluation targets connected AgentCore endpoints
 and keeps the required metered budget. HTTP PR evaluation remains unsupported.

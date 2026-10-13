@@ -1,5 +1,5 @@
 # Customer template. This is not a workflow for this repository.
-# Replace REVIEWED_ACTION_COMMIT with a reviewed, full SHA that contains the Action.
+# Pin the Action to a reviewed full implementation SHA.
 name: AQ evaluation
 on:
   pull_request_target:
@@ -78,7 +78,7 @@ jobs:
     steps:
       # No customer checkout, downloaded PR code, or build artifact enters this runner.
       - id: evaluation
-        uses: beyhangll/workbench-sdk/.github/actions/evaluate@REVIEWED_ACTION_COMMIT
+        uses: beyhangll/workbench-sdk/.github/actions/evaluate@7e35c68ab6d13c225da4e35f289c754439c60ff7
         continue-on-error: true
         with:
           endpoint: ${{ vars.AQ_ENDPOINT }}

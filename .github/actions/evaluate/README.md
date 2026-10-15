@@ -2,7 +2,9 @@
 
 This Action runs the existing `aq eval run` command once with an explicit
 AgentCore endpoint, tested commit, development row scope, current comparison,
-regression gate and required budget. It publishes one aggregate comment through
+regression gate and required budget. Optional `task` accepts an existing task UUID,
+uses held-out row scope and adds the SDK's server-provided task acceptance gate.
+Without it, the development comparison remains unchanged. It publishes one aggregate comment through
 the SDK publisher. It does not deploy the customer's agent or change its defaults.
 HTTP targets are not supported by this interface.
 
@@ -142,3 +144,16 @@ The workflow templates need customer deployment/access configuration and a
 reviewed Action pin before use. Offline tests validate these integration contracts.
 They do not establish live model quality, real publisher permissions, deployment
 or formal qualification.
+
+## Named tasks and releases
+
+Set `task` only for an existing task on the selected agent and dataset with the
+required owner-approved bar and data access. The Action retains and validates
+the exact task/agent/dataset binding, verdict, required slices and must-pass
+fields. Unknown, incomplete or mismatched acceptance cannot pass. It does not
+compute a second qualification policy. Aggregate projection drops task row
+payloads and is checked against the same SDK renderer and outcome gate.
+
+The [release and scheduled-run guide](../../../docs/sdk-release.md) separates
+prepared workflows from actual registry/customer activation. No package release
+or customer CI run is established by this source change.

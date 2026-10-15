@@ -1,0 +1,86 @@
+name: Build and release the customer SDK
+on:
+  push:
+    tags: ['v*']
+permissions: {}
+concurrency:
+  group: sdk-release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - run: python -I .github/release_sdk.py check-tag
+      - run: python -I -m pip --isolated install build==1.3.0 twine==6.2.0 'pytest>=8,<9' 'PyYAML>=6,<7' './packages/aq-sdk[test]'
+      - name: Offline SDK and integration contracts
+        run: |
+          python -I - <<'PY'
+          import socket, httpx, pytest
+          attempts = []
+          def blocked(*args, **kwargs):
+              attempts.append(True)
+              raise AssertionError('Release tests cannot use external transport')
+          async def async_blocked(*args, **kwargs):
+              return blocked()
+          httpx.HTTPTransport.handle_request = blocked
+          httpx.AsyncHTTPTransport.handle_async_request = async_blocked
+          original = socket.socket.connect
+          socket.socket.connect = lambda s, *a, **kw: blocked() if s.family in (socket.AF_INET, socket.AF_INET6) else original(s, *a, **kw)
+          socket.getaddrinfo = blocked
+          code = pytest.main(['-q', '-p', 'no:cacheprovider', 'packages/aq-sdk/tests', '.github/actions/evaluate/tests', '.github/tests'])
+          raise SystemExit(code or bool(attempts))
+          PY
+      - run: python -I -m build --outdir dist packages/aq-sdk
+      - run: python -I -m twine check dist/*
+      - run: sha256sum dist/*.whl dist/*.tar.gz > dist/SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sdk-dist-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    # The owner must configure this protected environment and its OIDC trust.
+    environment: package-release
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      SDK_REGISTRY_KIND: ${{ vars.SDK_REGISTRY_KIND }}
+      SDK_REGISTRY_REGION: ${{ secrets.SDK_REGISTRY_REGION }}
+      SDK_REGISTRY_DOMAIN: ${{ secrets.SDK_REGISTRY_DOMAIN }}
+      SDK_REGISTRY_OWNER: ${{ secrets.SDK_REGISTRY_OWNER }}
+      SDK_REGISTRY_REPOSITORY: ${{ secrets.SDK_REGISTRY_REPOSITORY }}
+      SDK_REGISTRY_ROLE: ${{ secrets.SDK_REGISTRY_ROLE }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      # Fail closed before requesting AWS credentials when owner inputs are absent.
+      - run: python -I .github/release_sdk.py check-publish
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: sdk-dist-${{ github.sha }}
+          path: dist
+      - run: cd dist && sha256sum --check SHA256SUMS
+      - run: python -I -m pip --isolated install twine==6.2.0
+      - uses: aws-actions/configure-aws-credentials@cabfdba3510de1431bac9dba27511d97497fc1001 # v5
+        with:
+          role-to-assume: ${{ secrets.SDK_REGISTRY_ROLE }}
+          aws-region: ${{ secrets.SDK_REGISTRY_REGION }}
+          mask-aws-account-id: true
+          disable-retry: true
+      - run: python -I .github/release_sdk.py publish

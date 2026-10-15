@@ -448,3 +448,202 @@ def test_isolated_interpreter_ignores_stale_workspace_imports(tmp_path):
     result = subprocess.run([sys.executable, "-I", "-c", check, str(tmp_path)], cwd=tmp_path,
                             env={**os.environ, "PYTHONPATH": str(tmp_path)}, capture_output=True)
     assert result.returncode == 0 and not marker.exists()
+
+
+TASK_ID = "d1000000-0000-0000-0000-000000000001"
+
+
+def task_payload(status="meets", code=0):
+    result = payload(code)
+    result["task"] = {
+        "id": TASK_ID,
+        "name": "Synthetic task",
+        "agent_id": fixtures.AGENT,
+        "dataset_id": fixtures.DS,
+    }
+    result["task_verdict"] = {
+        "experiment_id": result["experiment"]["id"],
+        "bar_version": 2,
+        "status": status,
+        "thresholds": [
+            {
+                "metric": "quality",
+                "status": status,
+                "value": 0.8,
+                "observed": 1,
+                "bound": 0.91,
+                "cases": 30,
+            }
+        ],
+        "requirements": [],
+    }
+    return result
+
+
+def test_task_input_is_retained_in_settings(tmp_path):
+    env, _ = environment(tmp_path)
+    env["AQ_CI_TASK"] = TASK_ID
+    assert getattr(action.settings(env), "task", None) == TASK_ID
+
+
+@pytest.mark.parametrize("status,code", [("meets", 0), ("below", 1), ("unknown", 3)])
+def test_action_uses_existing_cli_task_gate_and_held_out_scope(
+    tmp_path, monkeypatch, status, code
+):
+    env, _ = environment(tmp_path)
+    env["AQ_CI_TASK"] = TASK_ID
+    s = action.settings(env)
+    fake = fixtures.FakeAQ()
+    fake.tasks = [
+        {
+            "id": TASK_ID,
+            "name": "Synthetic task",
+            "agent_id": fixtures.AGENT,
+            "dataset_id": fixtures.DS,
+            "bar": {"version": 2},
+        }
+    ]
+    fake.task_verdict = task_payload(status, code)["task_verdict"]
+    fake.task_verdict["experiment_id"] = fake.result["id"]
+    client = Client(
+        Config(None, "aq_live_test_key", "https://aq.test", "https://app.test"),
+        transport=httpx.MockTransport(fake),
+        sleep=lambda _: None,
+    )
+    calls = []
+
+    def process(args, **kwargs):
+        calls.append(args)
+        out, err = io.StringIO(), io.StringIO()
+        returned = cli.main(args[4:], out=out, err=err, client=client)
+        return SimpleNamespace(
+            returncode=returned, stdout=out.getvalue(), stderr=err.getvalue()
+        )
+
+    monkeypatch.setattr(action.subprocess, "run", process)
+    dest = tmp_path / "aggregate"
+    comments = Comments()
+    assert action.run(s, dest, publish=comments.publish) == code
+    assert len(calls) == 1 and len(comments.writes) == 1
+    assert "--task=" + TASK_ID in calls[0]
+    assert fake.sent("POST", "/v1/experiments")["row_scope"] == "held_out"
+    saved = json.loads((dest / "aggregate-result.json").read_text())
+    assert saved["task"]["id"] == TASK_ID and saved["task_verdict"]["status"] == status
+    assert "Task" in (dest / "evaluation.md").read_text()
+
+
+@pytest.mark.parametrize("mutation", ["missing", "task", "agent", "dataset", "verdict"])
+def test_requested_task_binding_cannot_be_dropped_or_substituted(tmp_path, mutation):
+    s = configured(tmp_path)
+    s.task = TASK_ID
+    result = task_payload()
+    if mutation == "missing":
+        result.pop("task")
+    if mutation == "task":
+        result["task"]["id"] = "d1000000-0000-0000-0000-000000000002"
+    if mutation == "agent":
+        result["task"]["agent_id"] = "another-agent"
+    if mutation == "dataset":
+        result["task"]["dataset_id"] = "another-dataset"
+    if mutation == "verdict":
+        result["task_verdict"]["experiment_id"] = "another-experiment"
+    with pytest.raises(action.Refused):
+        action.validate_result(result, 0, s)
+
+
+def test_task_projection_keeps_gate_fields_but_not_private_rows(tmp_path):
+    s = configured(tmp_path)
+    s.task = TASK_ID
+    result = task_payload()
+    result["task"]["private"] = "PRIVATE_TASK_DATA"
+    result["task_verdict"]["rows"] = [{"output": "PRIVATE_TASK_OUTPUT"}]
+    dest = tmp_path / "aggregate"
+    assert (
+        action.run(s, dest, evaluate=lambda *_: (0, result), publish=Comments().publish)
+        == 0
+    )
+    public = "\n".join(p.read_text() for p in dest.iterdir())
+    assert "PRIVATE_TASK" not in public and TASK_ID in public
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"thresholds": None},
+        {"requirements": None},
+        {"slices": None},
+        {"slice_metadata_status": "unknown"},
+        {"acceptance_reason": "held_out_required"},
+        {"worst_slice": None},
+        {"requirements": [{"code": "configuration_binding", "status": "unknown"}]},
+        {
+            "slices": [
+                {
+                    "dimension": "language",
+                    "value": "synthetic",
+                    "cases": 3,
+                    "status": "unknown",
+                    "thresholds": [
+                        {"metric": "quality", "status": "unknown", "bound": None}
+                    ],
+                }
+            ]
+        },
+    ],
+)
+def test_task_aggregate_preserves_nulls_unknown_requirements_and_slices(
+    tmp_path, change
+):
+    s = configured(tmp_path)
+    s.task = TASK_ID
+    result = task_payload()
+    result["task_verdict"].update(change)
+    code, _ = report.outcome(
+        result["experiment"],
+        result["compare"],
+        None,
+        compare_wanted=True,
+        fail_on="regression",
+        task_wanted=True,
+        task_verdict=result["task_verdict"],
+    )
+    result["exit_code"] = code
+    dest = tmp_path / "aggregate"
+    assert (
+        action.run(
+            s, dest, evaluate=lambda *_: (code, result), publish=Comments().publish
+        )
+        == code
+    )
+    saved = json.loads((dest / "aggregate-result.json").read_text())
+    for key, value in change.items():
+        assert saved["task_verdict"][key] == value
+
+
+@pytest.mark.parametrize("value", ["   ", "task-name", "not-a-uuid"])
+def test_invalid_task_selector_refuses_before_execution(tmp_path, value):
+    env, _ = environment(tmp_path)
+    env["AQ_CI_TASK"] = value
+    with pytest.raises(action.Refused, match="task"):
+        action.settings(env)
+
+
+def test_task_reconciliation_refuses_another_requested_task_without_evaluation(
+    tmp_path,
+):
+    s = configured(tmp_path)
+    s.task = TASK_ID
+    result = task_payload()
+    retained = tmp_path / "retained.json"
+    retained.write_text(json.dumps(result))
+    s.reconcile_report = str(retained)
+    s.task = "d1000000-0000-0000-0000-000000000002"
+    comments = Comments()
+    with pytest.raises(action.Refused):
+        action.run(
+            s,
+            tmp_path / "aggregate",
+            evaluate=lambda *_: pytest.fail("No repeat evaluation"),
+            publish=comments.publish,
+        )
+    assert not comments.writes

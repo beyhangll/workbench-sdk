@@ -304,3 +304,38 @@ python -m pytest packages/aq-sdk/tests
 
 The tests use a fake AQ in memory. Nothing in them counts as evidence that the
 real service works.
+
+
+## Named task acceptance
+
+```text
+aq eval run --dataset policy-checks --target connected-agent --compare-to current \
+  --task policy-task --fail-on regression --budget 1 --report-file evaluation.md
+```
+
+`--task` selects an existing task by name or ID for the selected agent and
+dataset. It must have a signed bar before submission. The client reads the
+server's verdict for the retained experiment; it does not derive a second
+acceptance threshold, approve a release or change the bar. The existing
+`experiments:read` scope covers task resolution and verdict reads.
+
+A task below its bar exits 1. Missing, incomplete, unavailable or conflicting
+evidence exits 3. A passing verdict retains the signed bar version, counts,
+server-provided bounds and required-slice status in JSON, console and Markdown
+reports. Unknown bounds stay unknown. A development run cannot satisfy a
+held-out acceptance requirement. With `--fail-on regression`, both gates must
+pass; without a comparison, select scorers explicitly with `--scorer`.
+Comparisons without scored pairs cannot pass merely because row IDs match.
+
+The compatibility source is the reviewed task consumer at application revision
+`14f18254338f9a27cfc340b791d91c3372ae6155`, checked against API revision
+`3cd7deecf72100991155e956f150fbdbb6179ffe`. Required API reads are
+`GET /v1/agent-tasks?agent_id=...` and
+`GET /v1/experiments/{id}/verdict?task_id=...`; an API without them leaves the
+result unresolved. Existing explicit-baseline resolution and owned-check
+publication are retained. Future source updates should rerun the task-gate,
+comparison-report and publication tests against their intended API contract.
+
+The reusable Action and customer CI examples are separate release integration.
+This CLI update does not expose a new Action input, move their reviewed pin,
+publish a registry version, define a license or demonstrate customer CI access.

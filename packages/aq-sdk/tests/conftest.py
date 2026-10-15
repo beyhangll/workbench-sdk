@@ -49,6 +49,8 @@ class FakeAQ:
         self.statuses = ["running", "completed"]
         self.result = experiment("c0000000-0000-0000-0000-000000000009", "new run")
         self.compare = comparison()
+        self.tasks: list[dict[str, Any]] = []
+        self.task_verdict: dict[str, Any] | None = None
         self.errors: dict[tuple[str, str], tuple[int, dict[str, Any]]] = {}
         self.rows_pages: list[int] = []
 
@@ -72,6 +74,13 @@ class FakeAQ:
             return httpx.Response(200, json=self.scorers)
         if (method, path) == ("GET", "/v1/connected-agents"):
             return httpx.Response(200, json=self.agents)
+        if (method, path) == ("GET", "/v1/agent-tasks"):
+            assert req.url.params.get("agent_id") == AGENT
+            return httpx.Response(200, json=self.tasks)
+        if method == "GET" and path.endswith("/verdict"):
+            assert path == f"/v1/experiments/{self.result['id']}/verdict"
+            assert req.url.params.get("task_id") == self.tasks[0]["id"]
+            return httpx.Response(200, json=self.task_verdict)
         if (method, path) == ("GET", "/v1/experiments"):
             params = req.url.params
             if params.get("role") == "current":

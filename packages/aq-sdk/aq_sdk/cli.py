@@ -37,6 +37,8 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--dataset", required=True, help="Dataset name or ID.")
     run.add_argument("--target", required=True, help="Name of a connected agent.")
     run.add_argument("--compare-to", help="Experiment ID, exact experiment name, or current.")
+    run.add_argument("--task", help="Task name or ID on the selected agent and dataset. "
+                     "Gate on its signed bar: below exits 1; unresolved exits 3.")
     run.add_argument("--fail-on", choices=["regression"], help="Exit 1 when the comparison finds a regression.")
     run.add_argument("--scorer", action="append", default=[], help="Scorer name or ID. Repeat for more. "
                      "Default: the scorers of the --compare-to experiment.")
@@ -104,6 +106,8 @@ def run_eval(args: argparse.Namespace, out: TextIO, err: TextIO, client: Client 
 
     if args.fail_on and not args.compare_to:
         raise AQError("--fail-on needs --compare-to.", "Name the experiment to compare with, or use --compare-to current.")
+    if args.task is not None and not args.task.strip():
+        raise AQError("--task needs a task name or ID.")
     overrides = _overrides(args)
     if args.commit is not None and not re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", args.commit):
         raise AQError("--commit needs a full 40 or 64 character hexadecimal commit SHA.")
@@ -121,6 +125,7 @@ def run_eval(args: argparse.Namespace, out: TextIO, err: TextIO, client: Client 
     plan = resolve_plan(client, args.dataset, agent=agent["id"], compare_to=args.compare_to,
                         version=args.dataset_version, repeats=args.repeats, scorers=args.scorer)
     ds, base = plan["dataset"], plan["base"]
+    task = client.task(args.task, agent_id=agent["id"], dataset_id=ds["id"]) if args.task else None
     if base is not None and (base.get("progress") or {}).get("row_ids") is not None:
         raise AQError("The comparison baseline uses pinned row IDs, which this CLI cannot preserve.",
                       "Use a run interface that supports the exact selected row IDs. No run was started.")
@@ -153,6 +158,7 @@ def run_eval(args: argparse.Namespace, out: TextIO, err: TextIO, client: Client 
                       "Inspect the retained experiment before starting another run.")
     say(f"Experiment {started['id']} is running in AQ.")
     code, reason, exp, cmp, cmp_error = report.UNJUDGED, None, started, None, None
+    task_verdict, task_error = None, None
     previous = signal.signal(signal.SIGTERM, _on_term) if threading.current_thread() is threading.main_thread() else None
     try:
         exp = client.wait(started["id"], poll_s=args.poll, timeout_s=args.timeout, on_progress=lambda e: say(
@@ -168,16 +174,25 @@ def run_eval(args: argparse.Namespace, out: TextIO, err: TextIO, client: Client 
         if previous is not None:
             signal.signal(signal.SIGTERM, previous)
     if exp["status"] in ("completed", "stopped_budget", "failed", "cancelled", "interrupted"):
+        if task is not None:
+            try:
+                task_verdict = client.task_verdict(exp["id"], task["id"])
+            except AQError as err:
+                task_error = str(err)
         if base is not None and exp["status"] == "completed":
             try:
                 cmp = client.compare(base["id"], exp["id"])
             except AQError as err:
                 cmp_error = str(err)
         code, reason = report.outcome(exp, cmp, cmp_error, compare_wanted=base is not None, fail_on=args.fail_on,
-                                      allow_errors=args.allow_errors)
+                                      allow_errors=args.allow_errors, task_wanted=task is not None,
+                                      task_verdict=task_verdict, task_error=task_error)
     url = report.link(client.config, exp, base["id"] if base else None)
     result = {"exit_code": code, "reason": reason, "verdict": cmp["verdict"] if cmp else None,
               "experiment": exp, "compare": cmp, "link": url}
+    if task is not None:
+        result["task"] = {key: task[key] for key in ("id", "name", "agent_id", "dataset_id")}
+        result["task_verdict"] = task_verdict
     if args.report_file:
         try:
             Path(args.report_file).write_text(report.pr_summary(result), encoding="utf-8")
@@ -193,10 +208,15 @@ def run_eval(args: argparse.Namespace, out: TextIO, err: TextIO, client: Client 
                 say(line)
         elif cmp_error:
             say(f"The comparison could not be made. {cmp_error}")
+        if task is not None:
+            for line in report.task_lines(result["task"], task_verdict):
+                say(line)
         if url:
             say(f"Open the {'comparison' if base else 'experiment'}: {url}")
         if reason and code != report.OK:
             say(f"Result: {'fail' if code == report.REGRESSION else 'not judged'}. {reason}")
+        elif task is not None:
+            say("Result: pass. The candidate meets the task's signed bar." + (" No regression." if args.fail_on else ""))
         elif args.fail_on:
             say("Result: pass. No regression.")
     return code
@@ -207,7 +227,7 @@ def main(argv: list[str] | None = None, *, out: TextIO | None = None, err: TextI
     out, err = out or sys.stdout, err or sys.stderr
     args = parser().parse_args(argv)
     state: dict[str, bool] = {}
-    # Only a regression exits 1. A problem before the experiment starts is 2. After it starts, the run is unjudged: 3.
+    # A below-bar task or regression exits 1. Problems before/after starting exit 2/3.
     try:
         return run_eval(args, out, err, client, state)
     except AQError as exc:

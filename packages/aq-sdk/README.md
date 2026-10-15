@@ -310,7 +310,7 @@ real service works.
 
 ```text
 aq eval run --dataset policy-checks --target connected-agent --compare-to current \
-  --task policy-task --fail-on regression --budget 1 --report-file evaluation.md
+  --task policy-task --fail-on regression --row-scope held_out --budget 1 --report-file evaluation.md
 ```
 
 `--task` selects an existing task by name or ID for the selected agent and
@@ -323,7 +323,10 @@ A task below its bar exits 1. Missing, incomplete, unavailable or conflicting
 evidence exits 3. A passing verdict retains the signed bar version, counts,
 server-provided bounds and required-slice status in JSON, console and Markdown
 reports. Unknown bounds stay unknown. A development run cannot satisfy a
-held-out acceptance requirement. With `--fail-on regression`, both gates must
+held-out acceptance requirement. The current API requires `--row-scope held_out`
+for task acceptance; the default `all` and explicit `development` scopes remain
+unresolved. `--task` does not choose or change the dataset split.
+With `--fail-on regression`, both gates must
 pass; without a comparison, select scorers explicitly with `--scorer`.
 Comparisons without scored pairs cannot pass merely because row IDs match.
 

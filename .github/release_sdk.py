@@ -39,9 +39,15 @@ def validate(package: Path, tag: str, env: dict[str, str], *, publishing: bool) 
     if isinstance(license_value, dict):
         text = license_value.get("text")
         path = (package / license_value.get("file", "")).resolve()
-        license_value = (isinstance(text, str) and bool(text.strip())) or (
-            path.is_file() and path.is_relative_to(package.resolve())
-        )
+        try:
+            file_has_terms = (
+                path.is_file()
+                and path.is_relative_to(package.resolve())
+                and bool(path.read_text(encoding="utf-8").strip())
+            )
+        except (OSError, UnicodeError):
+            file_has_terms = False
+        license_value = (isinstance(text, str) and bool(text.strip())) or file_has_terms
     elif isinstance(license_value, str):
         license_value = bool(license_value.strip())
     else:

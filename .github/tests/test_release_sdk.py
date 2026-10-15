@@ -231,3 +231,38 @@ def test_publish_without_assumed_credentials_does_not_use_ambient_profile(
     )
     with pytest.raises(release.Refused, match="ambient"):
         release.publish(package, artifacts(tmp_path), "v0.1.0", e)
+
+
+@pytest.mark.parametrize("content", ["", " \n\t", "unreadable"])
+def test_empty_or_unreadable_license_file_stops_before_credentials(
+    package, tmp_path, monkeypatch, content
+):
+    (package / "pyproject.toml").write_text(
+        '[project]\nname="aq-sdk"\nversion="0.1.0"\nlicense={file="LICENSE"}\n'
+    )
+    license_file = package / "LICENSE"
+    license_file.write_text(content)
+    if content == "unreadable":
+        original = Path.read_text
+
+        def read_text(path, *args, **kwargs):
+            if path == license_file:
+                raise PermissionError("Synthetic unreadable license")
+            return original(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", read_text)
+    monkeypatch.setattr(
+        release.subprocess,
+        "run",
+        lambda *a, **k: pytest.fail("No credential lookup or publication"),
+    )
+    with pytest.raises(release.Refused, match="license"):
+        release.publish(package, artifacts(tmp_path), "v0.1.0", config())
+
+
+def test_nonempty_in_package_license_file_satisfies_only_declaration_preflight(package):
+    (package / "pyproject.toml").write_text(
+        '[project]\nname="aq-sdk"\nversion="0.1.0"\nlicense={file="LICENSE"}\n'
+    )
+    (package / "LICENSE").write_text("Synthetic terms for offline validation only.\n")
+    assert release.validate(package, "v0.1.0", config(), publishing=True) == "0.1.0"

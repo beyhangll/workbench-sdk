@@ -127,6 +127,10 @@ class Client:
     def experiment(self, experiment_id: str) -> dict[str, Any]:
         return self.get(f"/v1/experiments/{experiment_id}")
 
+    def development_check(self, experiment_id: str) -> dict[str, Any] | None:
+        """Read frozen development must-pass observations. This is not release acceptance."""
+        return self.get(f"/v1/experiments/{experiment_id}", development_must_pass="true").get("development_check")
+
     def compare(self, base: str, candidate: str) -> dict[str, Any]:
         return self.get("/v1/compare", base=base, candidate=candidate)
 

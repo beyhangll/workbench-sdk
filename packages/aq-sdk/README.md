@@ -365,3 +365,30 @@ comparison-report and publication tests against their intended API contract.
 The reusable Action and customer CI examples are separate release integration.
 This CLI update does not expose a new Action input, move their reviewed pin,
 publish a registry version, define a license or demonstrate customer CI access.
+
+### Development must-pass checks
+
+Use `--development-must-pass` on `aq eval run` to enforce rows marked
+`metadata.must_pass: true` in the executed frozen dataset version. This selects
+development rows and cannot be combined with `--task`, `--row-scope all` or
+`--row-scope held_out`. A compatible baseline must use the same version and scope.
+Keep `--fail-on regression` when the statistical regression check is also required.
+
+One verified critical failure exits 1 regardless of the statistical result.
+Unscored or incomplete cases exit 3 and are listed as unknown; they never pass.
+No marked cases also means unknown. All passing satisfies only this development
+condition, subject to the other normal controls. The result and PR comment say
+**development only, not release acceptance**. Signed task/held-out gating is unchanged.
+
+`Client.development_check(experiment_id)` reads the same server observation after
+the normal wait. It does not execute, rescore or select a newer dataset version.
+The CLI's opt-in fetches it explicitly, including after terminal SSE/wait results.
+Public development comments contain fixed wording, counts and frozen row numbers;
+case/trace text and private labels are excluded. If workspace masking prevents
+disclosure, the check remains unknown.
+
+The product Action accepts trusted job environment
+`AQ_CI_DEVELOPMENT_MUST_PASS=true`. Configure it on the protected base workflow,
+never from PR files or an artifact. This source change does not modify or run a
+workflow. The existing strict baseline, prompt, scorer, ownership and spending
+controls still apply.

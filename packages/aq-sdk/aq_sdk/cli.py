@@ -41,11 +41,12 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--compare-to", help="Experiment ID, exact experiment name, or current.")
     run.add_argument("--task", help="Task name or ID on the selected agent and dataset. "
                      "Gate on its signed bar: below exits 1; unresolved exits 3.")
+    run.add_argument("--development-must-pass", action="store_true", help="Fail on frozen development must-pass failures; unknown exits 3. Not release acceptance.")
     run.add_argument("--fail-on", choices=["regression"], help="Exit 1 when the comparison finds a regression.")
     run.add_argument("--scorer", action="append", default=[], help="Scorer name or ID. Repeat for more. "
                      "Default: the scorers of the --compare-to experiment.")
     run.add_argument("--dataset-version", type=int, help="Default: the version of the --compare-to experiment, else the latest.")
-    run.add_argument("--row-scope", choices=["all", "development", "held_out"], default="all",
+    run.add_argument("--row-scope", choices=["all", "development", "held_out"], default=None,
                      help="Which dataset rows to run. Default: all. Use development for development verification.")
     run.add_argument("--repeats", type=int, help="Default: the repeats of the --compare-to experiment, else 1.")
     run.add_argument("--concurrency", type=int, default=4)
@@ -111,6 +112,9 @@ def run_eval(args: argparse.Namespace, out: TextIO, err: TextIO, client: Client 
         raise AQError("--fail-on needs --compare-to.", "Name the experiment to compare with, or use --compare-to current.")
     if args.task is not None and not args.task.strip():
         raise AQError("--task needs a task name or ID.")
+    if args.development_must_pass and (args.task is not None or args.row_scope not in (None, "development")):
+        raise AQError("--development-must-pass requires development rows and cannot be combined with --task.")
+    row_scope = args.row_scope or ("development" if args.development_must_pass else "all")
     overrides = _overrides(args)
     if args.commit is not None and not re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", args.commit):
         raise AQError("--commit needs a full 40 or 64 character hexadecimal commit SHA.")
@@ -134,7 +138,7 @@ def run_eval(args: argparse.Namespace, out: TextIO, err: TextIO, client: Client 
                       "Use a run interface that supports the exact selected row IDs. No run was started.")
     body: dict[str, Any] = {
         "name": args.name or f"CLI run on {ds['name']} ({agent['name']})", "agent_id": agent["id"],
-        "dataset_id": ds["id"], "dataset_version": plan["version"], "row_scope": args.row_scope,
+        "dataset_id": ds["id"], "dataset_version": plan["version"], "row_scope": row_scope,
         "target": {"kind": kind, "agent_id": agent["id"], "overrides": overrides},
         "scorer_ids": [s["id"] for s in plan["scorers"]], "repeats": plan["repeats"], "concurrency": args.concurrency}
     body["budget_usd"] = args.budget
@@ -149,7 +153,7 @@ def run_eval(args: argparse.Namespace, out: TextIO, err: TextIO, client: Client 
             raise AQError("The API estimate did not confirm the requested endpoint and commit. No run was started.",
                           "Use an API version that supports per-run endpoints and commit metadata.")
     say(f"Starting {agent['name']} on {ds['name']} version {plan['version']} "
-        f"({ds['row_count']} rows in dataset, scope {args.row_scope}, "
+        f"({ds['row_count']} rows in dataset, scope {row_scope}, "
         f"{plan['repeats']} attempt{'s' if plan['repeats'] != 1 else ''} each"
         f"{', ' + ' and '.join(k.replace('_', ' ') for k in overrides) + ' overridden' if overrides else ', no overrides'}).")
     started = client.start(body)
@@ -162,6 +166,7 @@ def run_eval(args: argparse.Namespace, out: TextIO, err: TextIO, client: Client 
     say(f"Experiment {started['id']} is running in AQ.")
     code, reason, exp, cmp, cmp_error = report.UNJUDGED, None, started, None, None
     task_verdict, task_error = None, None
+    development_check = None
     previous = signal.signal(signal.SIGTERM, _on_term) if threading.current_thread() is threading.main_thread() else None
     try:
         exp = client.wait(started["id"], poll_s=args.poll, timeout_s=args.timeout, on_progress=lambda e: say(
@@ -177,6 +182,11 @@ def run_eval(args: argparse.Namespace, out: TextIO, err: TextIO, client: Client 
         if previous is not None:
             signal.signal(signal.SIGTERM, previous)
     if exp["status"] in ("completed", "stopped_budget", "failed", "cancelled", "interrupted"):
+        if args.development_must_pass:
+            try:
+                development_check = client.development_check(exp["id"])
+            except AQError:
+                pass  # Unavailable or masked observations remain unknown. Do not echo error bodies.
         if task is not None:
             try:
                 task_verdict = client.task_verdict(exp["id"], task["id"])
@@ -189,10 +199,13 @@ def run_eval(args: argparse.Namespace, out: TextIO, err: TextIO, client: Client 
                 cmp_error = str(err)
         code, reason = report.outcome(exp, cmp, cmp_error, compare_wanted=base is not None, fail_on=args.fail_on,
                                       allow_errors=args.allow_errors, task_wanted=task is not None,
-                                      task_verdict=task_verdict, task_error=task_error)
+                                      task_verdict=task_verdict, task_error=task_error,
+                                      development_wanted=args.development_must_pass, development_check=development_check)
     url = report.link(client.config, exp, base["id"] if base else None)
     result = {"exit_code": code, "reason": reason, "verdict": cmp["verdict"] if cmp else None,
               "experiment": exp, "compare": cmp, "link": url}
+    if args.development_must_pass:
+        result.update(development_must_pass=True, development_check=development_check)
     if task is not None:
         result["task"] = {key: task[key] for key in ("id", "name", "agent_id", "dataset_id")}
         result["task_verdict"] = task_verdict
@@ -213,6 +226,9 @@ def run_eval(args: argparse.Namespace, out: TextIO, err: TextIO, client: Client 
             say(f"The comparison could not be made. {cmp_error}")
         if task is not None:
             for line in report.task_lines(result["task"], task_verdict):
+                say(line)
+        if args.development_must_pass:
+            for line in report.development_lines(result):
                 say(line)
         if url:
             say(f"Open the {'comparison' if base else 'experiment'}: {url}")

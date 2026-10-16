@@ -19,6 +19,7 @@ from urllib.parse import quote, urlsplit
 from .config import Config
 
 OK, REGRESSION, USAGE, UNJUDGED = 0, 1, 2, 3
+DEVELOPMENT_UNKNOWN = "Development check unknown: frozen must-pass evidence could not be verified."
 VERDICT_WORDS = {"improvement": "Improvement", "regression": "Regression", "no_clear_difference": "No clear difference"}
 DECISION_WORDS = {"adopt_candidate": "Adopt candidate", "keep_current": "Keep current"}
 
@@ -205,10 +206,89 @@ def task_lines(task: dict[str, Any], verdict: dict[str, Any] | None) -> list[str
     return lines
 
 
+def development_outcome(exp: dict[str, Any], check: dict[str, Any] | None) -> tuple[int, str | None]:
+    """Validate server observations. Never derive a second release bar or confidence bound."""
+    unverified = (UNJUDGED, DEVELOPMENT_UNKNOWN)
+    if not isinstance(check, dict):
+        return unverified
+    if (check.get("kind") != "development_must_pass" or check.get("release_acceptance") is not False
+            or check.get("row_scope") != "development" or (exp.get("progress") or {}).get("row_scope") != "development"
+            or check.get("experiment_id") != exp.get("id")
+            or any(check.get(key) != exp.get(key) or exp.get(key) is None for key in
+                   ("dataset_id", "dataset_version_id", "dataset_version", "repeats"))
+            or any(type(check.get(k)) is not int or check[k] < 1 for k in ("dataset_version", "repeats"))
+            or check.get("reason") is not None):
+        return unverified
+    def integer(value):
+        return type(value) is int and value >= 0
+    if any(not integer(check.get(k)) for k in ("dataset_rows", "cases", "failures", "unresolved")):
+        return unverified
+    n, failed, unknown = (check[k] for k in ("cases", "failures", "unresolved"))
+    if not n or n > check["dataset_rows"] or failed > n or unknown > n:
+        return unverified
+    for key, count in (("failed_rows", failed), ("unknown_rows", unknown)):
+        values = check.get(key)
+        if (not isinstance(values, list) or len(values) != count
+                or any(type(v) is not int or not 0 < v <= check["dataset_rows"] for v in values) or len(set(values)) != count):
+            return unverified
+    expected = "failed" if failed else "unknown" if unknown else "passed"
+    specs, observations = exp.get("scorers"), check.get("scorers")
+    if (check.get("status") != expected or not isinstance(specs, list) or not specs
+            or not isinstance(observations, list) or len(observations) != len(specs)
+            or any(not isinstance(s, dict) or not isinstance(s.get("id"), str) for s in specs)
+            or len({s["id"] for s in specs}) != len(specs)
+            or any(not isinstance(s, dict) or type(s.get("cases")) is not int or s["cases"] != n
+                   or any(not integer(s.get(k)) or s[k] > n for k in ("failures", "unresolved")) for s in observations)
+            or {s.get("scorer_id") for s in observations} != {s["id"] for s in specs}
+            or len({s.get("scorer_id") for s in observations}) != len(observations)
+            or not max(s["failures"] for s in observations) <= failed <= sum(s["failures"] for s in observations)
+            or not max(s["unresolved"] for s in observations) <= unknown <= sum(s["unresolved"] for s in observations)):
+        return unverified
+    for observed in (check, *observations):
+        bound = _finite(observed.get("bound"))
+        if observed["unresolved"] and bound is not None or not observed["unresolved"] and (bound is None or not 0 <= bound <= 1):
+            return unverified
+    if failed:
+        return REGRESSION, f"Development check failed: {failed} of {n} must-pass cases failed."
+    if unknown:
+        return UNJUDGED, f"Development check unknown: {unknown} of {n} must-pass cases could not be scored."
+    return OK, None
+
+
+def development_lines(result: dict[str, Any]) -> list[str]:
+    """Fixed wording and numeric ordinals only. Never render case content or private labels."""
+    check = result.get("development_check")
+    checked, reason = development_outcome(result.get("experiment") or {}, check)
+    lines = ["## AQ development check", "Development only. Not release acceptance."]
+    if checked != OK:
+        lines.append(reason)
+    else:
+        lines.append(f"Development must-pass condition passed: all {check['cases']} cases passed.")
+        if result.get("exit_code") != OK:
+            lines.append("Development check did not pass the other existing check controls.")
+    if isinstance(check, dict) and reason != DEVELOPMENT_UNKNOWN:
+        for key, label in (("failed_rows", "Failed must-pass rows"), ("unknown_rows", "Unknown must-pass rows")):
+            values = check.get(key) or []
+            lines.append(label + ": " + (", ".join(str(v) for v in values) if values else "none") + ".")
+        lines.append(f"Row numbers refer to frozen dataset version {check['dataset_version']}.")
+        bound = _finite(check.get("bound"))
+        lines.append("Must-pass failure-rate upper bound: " + (f"{bound:.6g}." if bound is not None else "unknown."))
+    cmp = result.get("compare") or {}
+    lines.append("Statistical result: " + VERDICT_WORDS.get(cmp.get("verdict"), "unknown") + ".")
+    return lines
+
+
 def outcome(exp: dict[str, Any], cmp: dict[str, Any] | None, compare_error: str | None, *, compare_wanted: bool,
             fail_on: str | None, allow_errors: int = 0, task_wanted: bool = False,
-            task_verdict: dict[str, Any] | None = None, task_error: str | None = None) -> tuple[int, str | None]:
+            task_verdict: dict[str, Any] | None = None, task_error: str | None = None,
+            development_wanted: bool = False, development_check: dict[str, Any] | None = None) -> tuple[int, str | None]:
     """The exit code and the reason. See the module notes for what each code means."""
+    if development_wanted:
+        if task_wanted:
+            return UNJUDGED, "Development checks cannot establish signed task acceptance."
+        code, reason = development_outcome(exp, development_check)
+        if code != OK:
+            return code, reason
     if exp["status"] != "completed":
         why = exp.get("stop_reason") or "No reason was given."
         return UNJUDGED, f"The experiment ended as {exp['status']}. {why}"
@@ -286,6 +366,8 @@ def _markdown(text: str) -> str:
 
 def pr_summary(result: dict[str, Any]) -> str:
     """Render only aggregate report fields. Never include row inputs, outputs, keys or target settings."""
+    if result.get("development_must_pass") is True:
+        return "\n\n".join(development_lines(result)) + "\n"
     code, exp, cmp = result.get("exit_code"), result.get("experiment"), result.get("compare")
     task = result.get("task")
     lines = ["## AQ evaluation"]

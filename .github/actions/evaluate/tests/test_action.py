@@ -1622,7 +1622,8 @@ def test_default_example_is_plain_same_repository_and_pinned_without_pr_checkout
         assert job["if"] == "github.event.pull_request.head.repo.full_name == github.repository"
         assert not any("checkout" in step.get("uses", "") for step in job["steps"])
     assert evaluate["permissions"]["checks"] == "write"
-    assert evaluate["permissions"]["issues"] == "write"
+    assert evaluate["permissions"]["pull-requests"] == "write"
+    assert "issues" not in evaluate["permissions"]
     step = evaluate["steps"][0]
     assert step["uses"].endswith("@REVIEWED_ACTION_COMMIT")
     assert step["with"]["github-token"] == "${{ github.token }}"

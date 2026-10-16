@@ -103,7 +103,7 @@ integration requirement, not an outcome established by the offline tests.
 Configure the two protected environments with required reviewers and trusted
 base-branch access. Put the narrowly scoped build role in the deployment
 environment. Put `AQ_API_KEY` only in the evaluation environment. The example
-uses the built-in `GITHUB_TOKEN` with job-scoped `issues: write` and
+uses the built-in `GITHUB_TOKEN` with job-scoped `pull-requests: write` and
 `checks: write`, rather than requiring a new GitHub App. A separately supplied
 publisher token is also supported when approved and narrowly scoped. Supply trusted repository/environment variables for the API and UI
 addresses, connected agent, existing development dataset, budget, stable check

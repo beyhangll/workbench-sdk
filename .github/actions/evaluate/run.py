@@ -540,7 +540,8 @@ def guard_public_strings(public_strings: list[str], s: Settings) -> None:
     for prompt in (s.candidate_prompt, s.base_prompt):
         if prompt is None:
             continue
-        variants = {prompt.text, report._markdown(prompt.text), html.escape(prompt.text), quote(prompt.text, safe="")}
+        variants = {value for text in (prompt.text, prompt.text.strip()) if text
+                    for value in (text, report._markdown(text), html.escape(text), quote(text, safe=""))}
         variants.update(json.dumps(value)[1:-1] for value in tuple(variants))
         for text in public_strings:
             for _ in range(3):
@@ -597,7 +598,8 @@ def private_text(text: str, s: Settings) -> str:
     for prompt in (s.candidate_prompt, s.base_prompt):
         if prompt is None:
             continue
-        variants = {prompt.text, report._markdown(prompt.text), html.escape(prompt.text), quote(prompt.text, safe="")}
+        variants = {value for text in (prompt.text, prompt.text.strip()) if text
+                    for value in (text, report._markdown(text), html.escape(text), quote(text, safe=""))}
         variants.update(json.dumps(value)[1:-1] for value in tuple(variants))
         for value in sorted(variants, key=len, reverse=True):
             text = text.replace(value, "[private prompt removed]")

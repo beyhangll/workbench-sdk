@@ -2160,3 +2160,24 @@ def test_native_prompt_digest_is_reused_without_parallel_target_field(tmp_path):
     assert aggregate["experiment"]["target"].get("prompt_sha256") == s.candidate_prompt.sha256
     assert "system_prompt_sha256" not in aggregate["experiment"]["target"]
     action.validate_result(aggregate, 0, s, public_projection=True)
+
+
+@pytest.mark.parametrize("role", ["candidate_prompt", "base_prompt"])
+@pytest.mark.parametrize("encoding", ["plain", "html", "json", "markdown", "url"])
+def test_trimmed_complete_prompt_echo_refuses_without_changing_execution_bytes(tmp_path, role, encoding):
+    s, _ = prompt_configured(tmp_path)
+    frozen = getattr(s, role)
+    original, digest = frozen.text, frozen.sha256
+    text = original.strip()
+    echo = {"plain": text, "html": action.html.escape(text), "json": json.dumps(text)[1:-1],
+            "markdown": report._markdown(text), "url": action.quote(text, safe="")}[encoding]
+    with pytest.raises(action.Refused):
+        action.guard_public_strings([echo], s)
+    assert echo not in action.private_text(echo, s)
+    assert frozen.text == original and frozen.sha256 == digest and original.endswith("\n")
+
+
+def test_partial_prompt_fragment_does_not_introduce_generic_redaction(tmp_path):
+    s, _ = prompt_configured(tmp_path)
+    action.guard_public_strings(["Fictional candidate"], s)
+    assert action.private_text("Fictional candidate", s) == "Fictional candidate"

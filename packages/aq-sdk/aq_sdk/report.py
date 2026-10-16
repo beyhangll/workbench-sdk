@@ -71,6 +71,28 @@ def summary_lines(exp: dict[str, Any]) -> list[str]:
     return lines
 
 
+def _bounds_line(sc: dict[str, Any]) -> str:
+    interval = sc.get("interval")
+    interval = interval if isinstance(interval, dict) else {}
+    lower, upper = _finite(interval.get("lower")), _finite(interval.get("upper"))
+    if lower is not None and upper is not None and lower > upper:
+        lower = upper = None
+    methods = {"bonferroni-clopper-pearson-discordance": "Paired-difference confidence bounds",
+               "bootstrap-percentile-paired-difference": "Descriptive paired-difference bounds"}
+    method = interval.get("method")
+    method = method if isinstance(method, str) and method in methods else "unknown"
+    def bound(value):
+        return "unknown" if value is None else f"{value:+.6g}"
+    def alpha(value):
+        value = _finite(value)
+        return f"{value:.6g}" if value is not None and 0 < value < 1 else "unknown"
+    # The API's interval.alpha belongs to the lower endpoint. Never infer the upper alpha from it.
+    return (f"  {sc['name']}: {methods.get(method, 'Paired-difference bounds')} (candidate minus baseline): "
+            f"lower {bound(lower)}, upper {bound(upper)}, method {method}, "
+            f"lower one-sided alpha {alpha(interval.get('alpha'))}, "
+            f"upper one-sided alpha {alpha(sc.get('alpha_regression'))}.")
+
+
 def compare_lines(cmp: dict[str, Any]) -> list[str]:
     base = cmp["base"]
     lines = [f"Compared with \"{base['name']}\" on {cmp['matched_rows']} matched rows: "
@@ -87,6 +109,7 @@ def compare_lines(cmp: dict[str, Any]) -> list[str]:
                      f"{VERDICT_WORDS.get(sc['verdict'], sc['verdict'])}.")
         if "unchanged" in sc:
             lines.append(f"  {sc['name']}: {sc['unchanged']} same, {sc.get('excluded', 0)} excluded.")
+        lines.append(_bounds_line(sc))
     return lines
 
 
@@ -199,10 +222,6 @@ def outcome(exp: dict[str, Any], cmp: dict[str, Any] | None, compare_error: str 
         return UNJUDGED, "Scoring is incomplete. Still waiting for: " + ", ".join(pending) + "."
     if not fail_on:
         return OK, None
-    errors = (s.get("target_errors") or 0) + (s.get("timeouts") or 0)
-    if errors > allow_errors:
-        return UNJUDGED, (f"{errors} rows had task errors, and {allow_errors} are allowed. "
-                          "Fix the task or raise the allowed errors.")
     if compare_wanted and cmp is None:
         return UNJUDGED, f"The comparison could not be made. {compare_error or ''}".strip()
     if cmp is not None and cmp["matched_rows"] == 0:
@@ -213,15 +232,35 @@ def outcome(exp: dict[str, Any], cmp: dict[str, Any] | None, compare_error: str 
     if not required:
         return UNJUDGED, "The experiment did not report its requested scorers, so the gate cannot be checked."
     for side in (exp, cmp["base"]) if cmp is not None else (exp,):
-        summaries = {sc["scorer_id"]: sc for sc in (side.get("summary") or {}).get("scorers", [])}
+        summary = side.get("summary") or {}
+        rows, repeats = summary.get("rows"), side.get("repeats")
+        if (side.get("status") != "completed"
+                or type(rows) is not int or rows <= 0 or type(repeats) is not int or repeats <= 0
+                or type(summary.get("attempts")) is not int or summary["attempts"] != rows * repeats
+                or type(summary.get("ok")) is not int or not 0 < summary["ok"] <= rows * repeats
+                or any(type(summary.get(key)) is not int or summary[key] < 0
+                       for key in ("target_errors", "timeouts"))
+                or summary["ok"] + summary["target_errors"] + summary["timeouts"] != rows * repeats
+                or any(key in summary and (type(summary[key]) is not int or summary[key] != 0)
+                       for key in ("not_run", "rows_not_run"))
+                or any(key in (side.get("progress") or {})
+                       and (type(side["progress"][key]) is not int or side["progress"][key] != rows * repeats)
+                       for key in ("total", "finished"))):
+            return UNJUDGED, "The candidate or baseline has incomplete or unverified planned attempts."
+        summaries = {sc["scorer_id"]: sc for sc in summary.get("scorers", [])}
         missing = [name for sid, name in required.items() if sid not in summaries]
         if missing:
             return UNJUDGED, "Scoring is incomplete. No result was reported for: " + ", ".join(missing) + "."
         incomplete = [name for sid, name in required.items()
                       if summaries[sid].get("errors") != 0 or summaries[sid].get("pending") != 0
-                      or not summaries[sid].get("scored")]
+                      or type(summaries[sid].get("scored")) is not int
+                      or summaries[sid]["scored"] != summary["ok"]]
         if incomplete:
             return UNJUDGED, "Scoring is incomplete or errored for: " + ", ".join(incomplete) + "."
+    errors = s["target_errors"] + s["timeouts"]
+    if errors > allow_errors:
+        return UNJUDGED, (f"{errors} rows had task errors, and {allow_errors} are allowed. "
+                          "Fix the task or raise the allowed errors.")
     if cmp is not None:
         compared = {sc["scorer_id"] for sc in cmp.get("scorers", []) if sc.get("status") == "compared"}
         unavailable = [name for sid, name in required.items() if sid not in compared]

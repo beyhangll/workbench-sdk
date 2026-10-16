@@ -117,7 +117,8 @@ def test_a_run_that_cannot_be_judged_never_passes_fail_on(client, aq, case):
 
 
 def test_allow_errors_lets_a_few_task_errors_through(client, aq):
-    aq.result["summary"]["target_errors"] = 1
+    aq.result["summary"].update(ok=2, target_errors=1)
+    aq.result["summary"]["scorers"][0]["scored"] = 2
     result = make(client, compare_to="current", fail_on="regression", allow_errors=1)[0].run()
     assert result.exit_code == 0
 

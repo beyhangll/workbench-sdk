@@ -2096,3 +2096,33 @@ def test_malformed_or_unknown_null_override_refuses_with_fixed_error(tmp_path, o
     result["experiment"]["target"]["overrides"] = overrides
     with pytest.raises(action.Refused):
         action.validate_result(result, 0, s)
+
+
+def test_prompt_full_estimate_effective_endpoint_mismatch_refuses_before_dispatch(tmp_path):
+    s, _ = prompt_configured(tmp_path)
+    fake, client = prompt_client(s)
+    fake.estimate_change = lambda target: target.update(effective_agent_endpoint="DifferentEndpoint")
+    calls = []
+    try:
+        with pytest.raises(action.Refused):
+            _real_run(s, tmp_path / "effective-endpoint-drift", verify=lambda settings: action.preflight(settings,
+                client=client, transport=httpx.MockTransport(CheckAPI())), evaluate=lambda *_: calls.append("dispatch"),
+                check_publish=lambda *_: {})
+    finally:
+        client.close()
+    assert calls == []
+    assert not any(method == "POST" and path == "/v1/experiments" for method, path, _ in fake.calls)
+
+
+@pytest.mark.parametrize("credential", ["AQ_API_KEY", "AQ_CI_GITHUB_TOKEN"])
+@pytest.mark.parametrize("encoding", ["raw", "html", "markdown", "url", "json"])
+def test_encoded_known_credential_prompt_refuses_before_hash_or_network(tmp_path, monkeypatch, credential, encoding):
+    _, env = prompt_configured(tmp_path)
+    secret = 'synthetic-only<&"\\token'
+    env[credential] = secret
+    encoded = {"raw": secret, "html": action.html.escape(secret), "markdown": report._markdown(secret),
+               "url": action.quote(secret, safe=""), "json": json.dumps(secret)[1:-1]}[encoding]
+    Path(env["AQ_CI_SYSTEM_PROMPT_FILE"]).write_text("Do not publish " + encoded)
+    monkeypatch.setattr(action.PromptFile, "sha256", property(lambda _: pytest.fail("No credential hash")))
+    with pytest.raises(action.Refused):
+        action.settings(env)

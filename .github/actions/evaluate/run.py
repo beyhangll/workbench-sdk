@@ -228,9 +228,11 @@ def settings(env: dict[str, str]) -> Settings:
             raise Refused("Supply both candidate and protected-base prompt files, or neither.")
         if candidate_file:
             s.candidate_prompt, s.base_prompt = read_prompt_file(candidate_file), read_prompt_file(base_file)
-            if any(secret in prompt.text for prompt in (s.candidate_prompt, s.base_prompt)
-                   for secret in (s.api_key, s.github_token)):
-                raise Refused("A prompt file contains a known credential. No evaluation was submitted.")
+            for secret in (s.api_key, s.github_token):
+                variants = {secret, report._markdown(secret), html.escape(secret), quote(secret, safe="")}
+                variants.update(json.dumps(value)[1:-1] for value in tuple(variants))
+                if any(value in prompt.text for prompt in (s.candidate_prompt, s.base_prompt) for value in variants):
+                    raise Refused("A prompt file contains a known credential. No evaluation was submitted.")
         return s
     except Refused:
         raise
@@ -417,6 +419,7 @@ def preflight(s: Settings, *, client=None, transport=None) -> dict:
                     target = planned.get("target") or {}
                     if (target.get("agent_id") != agent["id"] or target.get("kind") != "agentcore"
                             or target.get("agent_endpoint") != s.agent_endpoint
+                            or target.get("effective_agent_endpoint") != s.agent_endpoint
                             or target.get("endpoint_overridden") is not True or target.get("commit_sha") != s.commit):
                         raise Refused("The planning estimate did not confirm the requested prompt target. No task was submitted.")
                     confirm_prompt(target, s.candidate_prompt)

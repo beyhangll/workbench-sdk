@@ -435,10 +435,11 @@ def validate_result(result: dict, code: int, s: Settings, baseline: dict | None 
     task = result.get("task")
     if s.task:
         if (not isinstance(task, dict) or task.get("id") != s.task
-                or task.get("agent_id") != exp.get("agent_id") or task.get("dataset_id") != exp.get("dataset_id")):
-            raise Refused("The retained task gate does not bind the configured task, agent and dataset.")
+                or not task.get("agent_id") or task.get("agent_id") != exp.get("agent_id")
+                or not task.get("dataset_id") or task.get("dataset_id") != exp.get("dataset_id")):
+            raise Refused("The retained task does not bind the requested task, agent and dataset.")
     elif task is not None or result.get("task_verdict") is not None:
-        raise Refused("The retained report introduced an unconfigured task gate.")
+        raise Refused("The retained report contains an unrequested task gate.")
     if not s.reconcile_report:
         target = exp.get("target") or {}
         if (target.get("agent_endpoint") != s.agent_endpoint or target.get("endpoint_overridden") is not True

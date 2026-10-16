@@ -1453,3 +1453,12 @@ def test_task_owner_mismatch_refuses_before_any_evaluation(tmp_path, owner):
         client.close()
     assert all(method == "GET" for method, _, _ in fake.calls)
     assert not github.writes
+
+
+@pytest.mark.parametrize("owner", ["agent_id", "dataset_id"])
+def test_task_binding_keeps_nonempty_owner_requirement(tmp_path, owner):
+    s, result = configured(tmp_path), task_payload()
+    s.task = TASK
+    result["task"][owner] = result["experiment"][owner] = None
+    with pytest.raises(action.Refused, match="task, agent and dataset"):
+        action.validate_result(result, 0, s)

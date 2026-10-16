@@ -10,6 +10,7 @@ import math
 import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -35,6 +36,68 @@ class MissingReport(Refused):
 
 SCORER_CONTROLS = ("id", "kind", "config", "threshold", "judge_provider", "judge_connection_id",
                    "uses_model", "needs_trace")
+MAX_PROMPT_BYTES = 256 * 1024
+
+
+@dataclass(frozen=True)
+class PromptFile:
+    path: str
+    text: str = field(repr=False)
+
+    @property
+    def sha256(self) -> str:
+        return hashlib.sha256(self.text.encode("utf-8")).hexdigest()
+
+
+def read_prompt_file(name: str) -> PromptFile:
+    """Read data only. Do not follow links or normalize the selected bytes."""
+    try:
+        path = Path(name).absolute()
+        if any(part.is_symlink() for part in (path, *path.parents)):
+            raise ValueError
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, "rb") as source:
+            if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                raise ValueError
+            data = source.read(MAX_PROMPT_BYTES + 1)
+        if len(data) > MAX_PROMPT_BYTES:
+            raise ValueError
+        text = data.decode("utf-8")
+        if not text.strip() or "\0" in text:
+            raise ValueError
+        if "\r" in text:
+            raise Refused("Prompt files must use LF line endings; CR was refused without normalization.")
+        return PromptFile(str(path), text)
+    except Refused:
+        raise
+    except (OSError, ValueError):
+        raise Refused("Prompt files must be readable nonempty UTF-8 regular files without symlinks, at most 256 KiB.") from None
+
+
+def prompt_digest(target: dict, *, public_projection: bool = False) -> str:
+    if not isinstance(target, dict):
+        raise Refused("The retained prompt target is missing or invalid.")
+    if public_projection:
+        digest = target.get("prompt_sha256")
+        if "overrides" in target or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise Refused("The retained public prompt binding is missing or invalid.")
+        return digest
+    overrides = target.get("overrides")
+    if (not isinstance(overrides, dict) or not isinstance(overrides.get("system_prompt"), str)
+            or any(key not in ("system_prompt", "model_id", "max_tokens", "reasoning_effort", "skills")
+                   or (key != "system_prompt" and value is not None) for key, value in overrides.items())):
+        raise Refused("The requested prompt or an undeclared override could not be verified.")
+    digest = hashlib.sha256(overrides["system_prompt"].encode("utf-8")).hexdigest()
+    if "prompt_sha256" in target and target["prompt_sha256"] != digest:
+        raise Refused("The retained prompt digest conflicts with its actual override.")
+    return digest
+
+
+def confirm_prompt(target: dict, expected: PromptFile, *, public_projection: bool = False) -> None:
+    digest = prompt_digest(target, public_projection=public_projection)
+    if (digest != expected.sha256
+            or (not public_projection and target["overrides"]["system_prompt"] != expected.text)):
+        raise Refused("The retained prompt differs from the frozen prompt file.")
 
 
 @dataclass
@@ -63,6 +126,14 @@ class Settings:
     base_repository_is_fork: bool
     publish_report_links: bool
     task: str = ""
+    candidate_prompt: PromptFile | None = field(default=None, repr=False)
+    base_prompt: PromptFile | None = field(default=None, repr=False)
+
+
+def confirm_prompt_files(s: Settings) -> None:
+    for frozen in (s.candidate_prompt, s.base_prompt):
+        if frozen is not None and read_prompt_file(frozen.path).text != frozen.text:
+            raise Refused("A frozen prompt file changed. No new evaluation may be submitted.")
 
 
 def settings(env: dict[str, str]) -> Settings:
@@ -145,12 +216,24 @@ def settings(env: dict[str, str]) -> Settings:
         if raw_task and not UUID.fullmatch(task):
             raise Refused("The optional task gate needs an explicit task UUID from trusted configuration.")
         task = task.lower()
-        return Settings(repository, number, commit, endpoint_name, env["AQ_CI_TARGET"], env["AQ_CI_DATASET"],
+        s = Settings(repository, number, commit, endpoint_name, env["AQ_CI_TARGET"], env["AQ_CI_DATASET"],
                         str(budget), api, env.get("AQ_UI_URL", "").strip() or api, env["AQ_API_KEY"],
                         env["AQ_CI_GITHUB_TOKEN"], publisher_id, key, timeout,
                         env.get("AQ_CI_RECONCILE_REPORT", "").strip(), base_sha.lower(), base_endpoint,
                         baseline.lower(), check_app_id, head_repository, head_repository_is_fork,
                         base_repository_is_fork, publish_report_links == "true", task)
+        candidate_file = env.get("AQ_CI_SYSTEM_PROMPT_FILE", "")
+        base_file = env.get("AQ_CI_BASE_SYSTEM_PROMPT_FILE", "")
+        if bool(candidate_file) != bool(base_file):
+            raise Refused("Supply both candidate and protected-base prompt files, or neither.")
+        if candidate_file:
+            s.candidate_prompt, s.base_prompt = read_prompt_file(candidate_file), read_prompt_file(base_file)
+            for secret in (s.api_key, s.github_token):
+                variants = {secret, report._markdown(secret), html.escape(secret), quote(secret, safe="")}
+                variants.update(json.dumps(value)[1:-1] for value in tuple(variants))
+                if any(value in prompt.text for prompt in (s.candidate_prompt, s.base_prompt) for value in variants):
+                    raise Refused("A prompt file contains a known credential. No evaluation was submitted.")
+        return s
     except Refused:
         raise
     except (KeyError, TypeError, ValueError, OSError, InvalidOperation):
@@ -280,6 +363,7 @@ def complete_baseline(base: dict) -> None:
 def preflight(s: Settings, *, client=None, transport=None) -> dict:
     """Validate a protected pipeline's declared binding, not deployed-source attestation."""
     try:
+        confirm_prompt_files(s)
         confirm_context(s, transport=transport)
         own = client is None
         if own:
@@ -310,6 +394,10 @@ def preflight(s: Settings, *, client=None, transport=None) -> dict:
             if (base.get("progress") or {}).get("include_rejected") is not False:
                 raise Refused("The existing CLI cannot preserve an include-all or unknown legacy rejected-row policy.")
             complete_baseline(base)
+            if s.candidate_prompt:
+                if agent.get("supports_overrides") is not True or agent.get("non_production") is not True:
+                    raise Refused("Prompt files require a non-production agent that explicitly supports overrides.")
+                confirm_prompt(base.get("target") or {}, s.base_prompt)
             if not s.reconcile_report:
                 frozen = scorer_controls(base["scorers"])
                 current = client.estimate({"scorers_only": True, "agent_id": agent["id"],
@@ -320,6 +408,21 @@ def preflight(s: Settings, *, client=None, transport=None) -> dict:
                     "row_scope": row_scope, "include_rejected": False})
                 if not isinstance(current, dict) or scorer_controls(current.get("scorers"), resolved=True) != frozen:
                     raise Refused("Current scoring controls differ from the frozen baseline. No task was submitted.")
+                if s.candidate_prompt:
+                    planned = client.estimate({"agent_id": agent["id"], "dataset_id": dataset["id"],
+                        "dataset_version": base["dataset_version"], "budget_usd": s.budget,
+                        "target": {"kind": "agentcore", "agent_id": agent["id"],
+                                   "agent_endpoint": s.agent_endpoint, "commit_sha": s.commit,
+                                   "overrides": {"system_prompt": s.candidate_prompt.text}},
+                        "scorer_ids": [sc["id"] for sc in base["scorers"]], "repeats": base["repeats"],
+                        "row_scope": row_scope, "include_rejected": False, "concurrency": 1})
+                    target = planned.get("target") or {}
+                    if (target.get("agent_id") != agent["id"] or target.get("kind") != "agentcore"
+                            or target.get("agent_endpoint") != s.agent_endpoint
+                            or target.get("effective_agent_endpoint") != s.agent_endpoint
+                            or target.get("endpoint_overridden") is not True or target.get("commit_sha") != s.commit):
+                        raise Refused("The planning estimate did not confirm the requested prompt target. No task was submitted.")
+                    confirm_prompt(target, s.candidate_prompt)
             return base
         finally:
             if own:
@@ -330,10 +433,12 @@ def preflight(s: Settings, *, client=None, transport=None) -> dict:
         raise Refused("The read-only base-build preflight could not be verified. No task was submitted.") from None
 
 
-def aggregate_result(result: dict, *, publish_report_links: bool = True) -> dict:
+def aggregate_result(result: dict, *, publish_report_links: bool = True, prompt_bindings: bool = False) -> dict:
     """Project public fields without changing the validated original execution result."""
     if type(publish_report_links) is not bool:
         raise Refused("The report-link projection needs an explicit boolean.")
+    if type(prompt_bindings) is not bool:
+        raise Refused("The prompt-binding projection needs an explicit boolean.")
     expected_body = report.pr_summary(result)
     if not publish_report_links:
         result = {key: value for key, value in result.items() if key != "link"}
@@ -377,6 +482,9 @@ def aggregate_result(result: dict, *, publish_report_links: bool = True) -> dict
         out = selected(exp, ("id", "agent_id", "dataset_id", "dataset_version", "repeats", "name", "status", "stop_reason"))
         out["target"] = selected(exp.get("target") or {}, ("kind", "agent_id", "commit_sha", "agent_endpoint",
                                                             "effective_agent_endpoint", "endpoint_overridden"))
+        if prompt_bindings:
+            target = exp.get("target") or {}
+            out["target"]["prompt_sha256"] = prompt_digest(target, public_projection="overrides" not in target)
         out["scorers"] = [selected(s, ("id", "name")) for s in exp.get("scorers", [])]
         summary = exp.get("summary") or {}
         out["summary"] = selected(summary, ("rows", "attempts", "ok", "target_errors", "timeouts", "not_run", "rows_not_run", "rows_with_errors"))
@@ -429,6 +537,19 @@ def guard_public_strings(public_strings: list[str], s: Settings) -> None:
         variants = (secret, report._markdown(secret), html.escape(secret), quote(secret, safe=""))
         if any(value and value in text for value in variants for text in public_strings):
             raise Refused("The public aggregate contains a known credential. Publication was refused.")
+    for prompt in (s.candidate_prompt, s.base_prompt):
+        if prompt is None:
+            continue
+        variants = {value for text in (prompt.text, prompt.text.strip()) if text
+                    for value in (text, report._markdown(text), html.escape(text), quote(text, safe=""))}
+        variants.update(json.dumps(value)[1:-1] for value in tuple(variants))
+        for text in public_strings:
+            for _ in range(3):
+                if any(value and value in text for value in variants):
+                    raise Refused("The public aggregate contains a known private prompt. Publication was refused.")
+                text = html.unescape(unquote(text))
+                text = re.sub(r"\\u([0-9a-fA-F]{4})", lambda m: chr(int(m[1], 16)), text)
+                text = re.sub(r"\\([^\w\s])", r"\1", text)
     if s.publish_report_links:
         return
     known = set()
@@ -474,10 +595,18 @@ def private_text(text: str, s: Settings) -> str:
         variants.update(json.dumps(value)[1:-1] for value in tuple(variants))
         for value in sorted(variants, key=len, reverse=True):
             text = text.replace(value, "[credential removed]")
+    for prompt in (s.candidate_prompt, s.base_prompt):
+        if prompt is None:
+            continue
+        variants = {value for text in (prompt.text, prompt.text.strip()) if text
+                    for value in (text, report._markdown(text), html.escape(text), quote(text, safe=""))}
+        variants.update(json.dumps(value)[1:-1] for value in tuple(variants))
+        for value in sorted(variants, key=len, reverse=True):
+            text = text.replace(value, "[private prompt removed]")
     return text
 
 
-def validate_result(result: dict, code: int, s: Settings, baseline: dict | None = None) -> None:
+def validate_result(result: dict, code: int, s: Settings, baseline: dict | None = None, *, public_projection: bool = False) -> None:
     if not isinstance(result, dict) or type(result.get("exit_code")) is not int or result["exit_code"] != code:
         raise Refused("The CLI did not produce a report matching its exit status.")
     if code not in (0, 1, 2, 3):
@@ -493,6 +622,8 @@ def validate_result(result: dict, code: int, s: Settings, baseline: dict | None 
             raise Refused("The retained task does not bind the requested task, agent and dataset.")
     elif task is not None or result.get("task_verdict") is not None:
         raise Refused("The retained report contains an unrequested task gate.")
+    if s.candidate_prompt:
+        confirm_prompt(exp.get("target") or {}, s.candidate_prompt, public_projection=public_projection)
     if not s.reconcile_report:
         target = exp.get("target") or {}
         if (target.get("agent_endpoint") != s.agent_endpoint or target.get("endpoint_overridden") is not True
@@ -517,15 +648,21 @@ def validate_result(result: dict, code: int, s: Settings, baseline: dict | None 
                 or (base.get("target") or {}).get("commit_sha") != s.base_commit
                 or (base.get("target") or {}).get("effective_agent_endpoint") != s.base_endpoint):
             raise Refused("The retained comparison substituted the protected baseline.")
+        if s.candidate_prompt:
+            confirm_prompt(base.get("target") or {}, s.base_prompt, public_projection=public_projection)
+            confirm_prompt(candidate.get("target") or {}, s.candidate_prompt, public_projection=public_projection)
         if baseline is not None:
             for field in ("id", "agent_id", "dataset_id", "dataset_version", "repeats", "scorers", "target"):
                 before, after = baseline.get(field), base.get(field)
-                if s.reconcile_report and field == "target":
+                if (s.reconcile_report or public_projection) and field == "target":
                     # A redacted historical artifact can reconcile an owned publication,
                     # never attest unrecorded private configuration or write a new result.
                     keys = ("kind", "agent_id", "commit_sha", "agent_endpoint", "effective_agent_endpoint", "endpoint_overridden")
+                    if s.candidate_prompt:
+                        confirm_prompt(before or {}, s.base_prompt)
+                        confirm_prompt(after or {}, s.base_prompt, public_projection=True)
                     before, after = selected(before or {}, keys), selected(after or {}, keys)
-                if s.reconcile_report and field == "scorers":
+                if (s.reconcile_report or public_projection) and field == "scorers":
                     before, after = ([selected(sc, ("id", "name")) for sc in side] for side in (before or [], after or []))
                 if before != after:
                     raise Refused("The baseline configuration changed between preflight and comparison.")
@@ -534,9 +671,9 @@ def validate_result(result: dict, code: int, s: Settings, baseline: dict | None 
             before = baseline.get("scorers") or []
             after = exp.get("scorers") or []
             keys = SCORER_CONTROLS
-            if s.reconcile_report:
+            if s.reconcile_report or public_projection:
                 keys = ("id",)
-            if s.reconcile_report:
+            if s.reconcile_report or public_projection:
                 before, after = (sorted((selected(sc, keys) for sc in side), key=lambda sc: str(sc.get("id")))
                                  for side in (before, after))
             else:
@@ -580,6 +717,18 @@ def execute(s: Settings, private: Path) -> tuple[int, dict]:
             "--timeout=" + str(s.timeout), "--report-file=/dev/null", "--json"]
     if s.task:
         args.append("--task=" + s.task)
+    if s.candidate_prompt:
+        confirm_prompt_files(s)
+        prompt_path = private / "candidate-system-prompt.txt"
+        try:
+            descriptor = os.open(prompt_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as prompt_file:
+                prompt_file.write(s.candidate_prompt.text)
+        except OSError:
+            raise Refused("The exclusive private prompt snapshot could not be created. No task was submitted.") from None
+        if read_prompt_file(str(prompt_path)).text != s.candidate_prompt.text:
+            raise Refused("The private prompt snapshot changed. No task was submitted.")
+        args.extend(("--system-prompt-file=" + str(prompt_path), "--concurrency=1"))
     # The public report is written only after the known-secret checks below.
     # Capture privately in memory, never stream raw stdout/stderr to the runner log.
     completed = subprocess.run(args, cwd=private, env=env, capture_output=True, text=True, check=False)
@@ -601,7 +750,7 @@ def publish_check(result: dict | None, s: Settings, *, reconcile_only=False, tra
         if result is None:
             conclusion, body = "failure", "Evaluation could not be judged or publication could not be confirmed. Inspect the retained private records."
         else:
-            validate_result(result, result.get("exit_code"), s)
+            validate_result(result, result.get("exit_code"), s, public_projection=True)
             code = result["exit_code"]
             conclusion = ("failure" if code != 0 else "neutral" if result["verdict"] == "no_clear_difference" else "success")
             body = public_body(result, s)
@@ -711,16 +860,26 @@ def run(s: Settings, output: Path, *, evaluate: Callable = execute, publish: Cal
     os.chmod(private, 0o700)
     code, status, comment_id = None, "failed", None
     checked = {"status": "failed", "check_run_id": None, "conclusion": None}
+    prompt_bindings = None
     try:
+        confirm_prompt_files(s)
         baseline = verify(s)  # Scorer-only preflight precedes evaluation/session/task dispatch.
         if s.reconcile_report:
             result = json.loads(Path(s.reconcile_report).read_text())
             code = result.get("exit_code")
         else:
             code, result = evaluate(s, private)  # Exactly one CLI invocation. No replacement submission.
-        validate_result(result, code, s, baseline)
+        validate_result(result, code, s, baseline, public_projection=bool(s.reconcile_report))
         confirm(s)  # Recheck head/base drift before either publication side effect.
-        aggregate = aggregate_result(result, publish_report_links=s.publish_report_links)
+        aggregate = aggregate_result(result, publish_report_links=s.publish_report_links,
+                                     prompt_bindings=s.candidate_prompt is not None)
+        if s.candidate_prompt:
+            validate_result(aggregate, code, s, public_projection=True)
+            base_target = ((aggregate.get("compare") or {}).get("base") or {}).get("target") or {}
+            prompt_bindings = {"base_commit": base_target.get("commit_sha"),
+                               "candidate_commit": aggregate["experiment"]["target"]["commit_sha"],
+                               "base_sha256": base_target.get("prompt_sha256"),
+                               "candidate_sha256": aggregate["experiment"]["target"]["prompt_sha256"]}
         body = public_body(aggregate, s)
         (output / "aggregate-result.json").write_text(json.dumps(aggregate, indent=2) + "\n")
         (output / "evaluation.md").write_text(body)
@@ -745,6 +904,8 @@ def run(s: Settings, output: Path, *, evaluate: Callable = execute, publish: Cal
         # Preserve the actual process exit even when its report or publication failed.
         metadata = {"evaluation_exit_code": code if type(code) is int and code in (0, 1, 2, 3) else None,
                     "publication_status": status, "comment_id": comment_id, "check_publication": checked}
+        if prompt_bindings is not None:
+            metadata["system_prompt_bindings"] = prompt_bindings
         (output / "publication.json").write_text(json.dumps(metadata, indent=2) + "\n")
 
 

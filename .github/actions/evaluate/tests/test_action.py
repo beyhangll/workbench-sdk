@@ -1,5 +1,6 @@
 """Offline Action contracts. No cloud calls, model calls or real PR comments."""
 import importlib.util
+import hashlib
 import io
 import json
 import os
@@ -1784,3 +1785,399 @@ def test_actual_cli_keeps_private_link_only_in_original_debug_record(tmp_path, m
     assert sum(method == "POST" and path == "/v1/experiments" for method, path, _ in fake.calls) == 1
     assert PRIVATE_UI_HOST not in json.dumps(public)
     assert PRIVATE_UI_HOST not in json.dumps(github.rows) and len(comments.writes) == 1
+
+
+# Prompt files are synthetic data, never a checkout or executable PR input.
+def prompt_configured(tmp_path, *, candidate="Fictional candidate prompt.\n", base="Fictional base prompt.\n"):
+    env, _ = environment(tmp_path)
+    head_file, base_file = tmp_path / "head-prompt.txt", tmp_path / "base-prompt.txt"
+    head_file.write_bytes(candidate.encode("utf-8"))
+    base_file.write_bytes(base.encode("utf-8"))
+    env.update(AQ_CI_SYSTEM_PROMPT_FILE=str(head_file), AQ_CI_BASE_SYSTEM_PROMPT_FILE=str(base_file))
+    return action.settings(env), env
+
+
+def prompt_payload(s, code=0, verdict="no_clear_difference"):
+    result = payload(code, verdict)
+    for target, text in ((result["experiment"]["target"], s.candidate_prompt.text),
+                         (result["compare"]["base"]["target"], s.base_prompt.text)):
+        target["overrides"] = {"system_prompt": text, "model_id": None,
+                               "max_tokens": None, "reasoning_effort": None, "skills": None}
+    return result
+
+
+@pytest.mark.parametrize("text", ["Fictional åäö.\n", "Fictional no final newline"])
+def test_prompt_files_freeze_utf8_and_trailing_newlines_before_preflight(tmp_path, text):
+    s, _ = prompt_configured(tmp_path, candidate=text)
+    assert s.candidate_prompt.text.encode("utf-8") == text.encode("utf-8")
+    assert s.candidate_prompt.sha256 == hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+@pytest.mark.parametrize("bad", ["missing_pair", "missing", "symlink", "directory", "empty", "oversized", "invalid_utf8", "crlf", "credential"])
+def test_invalid_prompt_files_refuse_before_any_network(tmp_path, bad):
+    s, env = prompt_configured(tmp_path)
+    path = Path(env["AQ_CI_SYSTEM_PROMPT_FILE"])
+    if bad == "missing_pair":
+        env.pop("AQ_CI_BASE_SYSTEM_PROMPT_FILE")
+    elif bad == "missing":
+        path.unlink()
+    elif bad == "symlink":
+        path.unlink()
+        path.symlink_to(env["AQ_CI_BASE_SYSTEM_PROMPT_FILE"])
+    elif bad == "directory":
+        path.unlink()
+        path.mkdir()
+    else:
+        path.write_bytes({"empty": b" \n", "oversized": b"x" * (256 * 1024 + 1), "invalid_utf8": b"\xff",
+                          "crlf": b"Fictional.\r\n", "credential": API_KEY.encode()}[bad])
+    with pytest.raises(action.Refused):
+        action.settings(env)
+
+
+def test_prompt_drift_refuses_before_evaluator_or_session_creation(tmp_path):
+    s, env = prompt_configured(tmp_path)
+    Path(env["AQ_CI_SYSTEM_PROMPT_FILE"]).write_text("Changed fictional prompt.")
+    calls = []
+    with pytest.raises(action.Refused):
+        _real_run(s, tmp_path / "drift-prompts", verify=lambda _: calls.append("network"),
+                  evaluate=lambda *_: calls.append("dispatch"), check_publish=lambda *_: {})
+    assert calls == []
+
+
+def test_prompt_bytes_reach_existing_cli_file_option_privately_and_serially(tmp_path, monkeypatch):
+    s, _ = prompt_configured(tmp_path)
+    private = tmp_path / "private"
+    private.mkdir()
+    def execute(args, **kwargs):
+        path = Path(next(arg.split("=", 1)[1] for arg in args if arg.startswith("--system-prompt-file=")))
+        assert path.parent == private
+        assert path.read_bytes() == s.candidate_prompt.text.encode("utf-8")
+        assert path.stat().st_mode & 0o777 == 0o600
+        assert "--concurrency=1" in args and s.candidate_prompt.text not in " ".join(args)
+        assert COMMENT_TOKEN not in json.dumps(kwargs, default=str)
+        return SimpleNamespace(returncode=0, stdout=json.dumps(prompt_payload(s)), stderr="")
+    monkeypatch.setattr(action.subprocess, "run", execute)
+    assert action.execute(s, private)[0] == 0
+
+
+@pytest.mark.parametrize("change", ["base", "candidate", "missing", "extra_model", "extra_unknown", "forged_digest"])
+def test_requested_prompt_or_unrequested_override_cannot_be_substituted(tmp_path, change):
+    s, _ = prompt_configured(tmp_path)
+    result = prompt_payload(s)
+    target = result["compare"]["base"]["target"] if change == "base" else result["experiment"]["target"]
+    if change in ("base", "candidate"):
+        target["overrides"]["system_prompt"] += " changed"
+    elif change == "missing":
+        target.pop("overrides")
+    elif change == "extra_model":
+        target["overrides"]["model_id"] = "other-model"
+    elif change == "extra_unknown":
+        target["overrides"]["skills"] = []
+    else:
+        target.pop("overrides")
+        target["prompt_sha256"] = s.candidate_prompt.sha256
+    with pytest.raises(action.Refused):
+        action.validate_result(result, 0, s)
+
+
+def test_only_derived_prompt_digests_survive_aggregate_and_reconciliation(tmp_path):
+    s, _ = prompt_configured(tmp_path)
+    original = prompt_payload(s)
+    action.validate_result(original, 0, s)
+    aggregate = action.aggregate_result(original, prompt_bindings=True)
+    action.validate_result(aggregate, 0, s, public_projection=True)
+    assert aggregate["experiment"]["target"]["prompt_sha256"] == s.candidate_prompt.sha256
+    assert aggregate["compare"]["base"]["target"]["prompt_sha256"] == s.base_prompt.sha256
+    assert s.candidate_prompt.text not in json.dumps(aggregate) and "overrides" not in aggregate["experiment"]["target"]
+    assert original["experiment"]["target"]["overrides"]["system_prompt"] == s.candidate_prompt.text
+    assert report.pr_summary(aggregate) == report.pr_summary(original)
+    aggregate["experiment"]["target"]["prompt_sha256"] = "0" * 64
+    with pytest.raises(action.Refused):
+        action.validate_result(aggregate, 0, s, public_projection=True)
+
+
+class PromptActionFake(ActionFake):
+    def __init__(self, s):
+        super().__init__()
+        self.base = prompt_payload(s)["compare"]["base"]
+        self.agents[0].update(non_production=True, supports_overrides=True)
+        self.result["progress"].update(row_scope="development", include_rejected=False)
+        self.compare["base"], self.compare["candidate"] = self.base, self.result
+        self.estimate_change = lambda target: None
+
+    def __call__(self, req):
+        body = self.body(req)
+        if req.method == "GET" and req.url.path == "/v1/experiments/" + fixtures.BASE:
+            # Preserve this immutable base, including on post-execution reconciliation.
+            return fixtures.FakeAQ.__call__(self, req)
+        if req.method == "POST" and req.url.path == "/v1/experiments/estimate" and not body.get("scorers_only"):
+            self.calls.append((req.method, req.url.path, body))
+            target = {**body["target"], "endpoint_overridden": True,
+                      "effective_agent_endpoint": body["target"]["agent_endpoint"]}
+            self.estimate_change(target)
+            return httpx.Response(200, json={"target": target, "calls": 3, "estimated_cost_usd": None})
+        return super().__call__(req)
+
+
+def prompt_client(s):
+    fake = PromptActionFake(s)
+    return fake, Client(Config(None, API_KEY, s.endpoint, s.ui_url),
+                        transport=httpx.MockTransport(fake), sleep=lambda _: None)
+
+
+@pytest.mark.parametrize("change", ["unsupported", "production", "base", "estimate_missing", "estimate_wrong", "estimate_model", "estimate_commit"])
+def test_prompt_preflight_refuses_before_cli_dispatch(tmp_path, change):
+    s, _ = prompt_configured(tmp_path)
+    fake, client = prompt_client(s)
+    if change == "unsupported":
+        fake.agents[0]["supports_overrides"] = False
+    elif change == "production":
+        fake.agents[0]["non_production"] = False
+    elif change == "base":
+        fake.base["target"]["overrides"]["system_prompt"] = "Wrong base"
+    elif change == "estimate_missing":
+        fake.estimate_change = lambda target: target.pop("overrides")
+    elif change == "estimate_wrong":
+        fake.estimate_change = lambda target: target["overrides"].update(system_prompt="Ignored request")
+    elif change == "estimate_model":
+        fake.estimate_change = lambda target: target["overrides"].update(model_id="different-model")
+    else:
+        fake.estimate_change = lambda target: target.update(commit_sha=BASE_SHA)
+    calls = []
+    try:
+        with pytest.raises(action.Refused):
+            _real_run(s, tmp_path / "preflight-refusal", verify=lambda settings: action.preflight(settings,
+                client=client, transport=httpx.MockTransport(CheckAPI())), evaluate=lambda *_: calls.append("dispatch"),
+                check_publish=lambda *_: {})
+    finally:
+        client.close()
+    assert not calls and not any(method == "POST" and path == "/v1/experiments" for method, path, _ in fake.calls)
+
+
+@pytest.mark.parametrize("code,verdict", [(0, "no_clear_difference"), (1, "regression")])
+def test_actual_cli_prompt_file_preflight_publication_and_reconcile(tmp_path, monkeypatch, code, verdict):
+    s, _ = prompt_configured(tmp_path)
+    fake, client = prompt_client(s)
+    fake.compare.update(verdict=verdict, decision="adopt_candidate" if verdict == "improvement" else "keep_current")
+    if code == 1:
+        fake.compare["scorers"] = fixtures.comparison("regression")["scorers"]
+    dispatches, comments, github = [], Comments(), CheckAPI()
+    def process(args, **kwargs):
+        dispatches.append(args)
+        out, err = io.StringIO(), io.StringIO()
+        returned = cli.main(args[4:], out=out, err=err, client=client)
+        return SimpleNamespace(returncode=returned, stdout=out.getvalue(), stderr=err.getvalue())
+    monkeypatch.setattr(action.subprocess, "run", process)
+    def verify(settings):
+        return action.preflight(settings, client=client, transport=httpx.MockTransport(github))
+    def check(data, settings, **kw):
+        return action.publish_check(data, settings, transport=httpx.MockTransport(github), **kw)
+    try:
+        dest = tmp_path / "prompt-publication"
+        actual = _real_run(s, dest, verify=verify, publish=comments.publish,
+                           confirm=lambda _: None, check_publish=check)
+        assert actual == code and len(dispatches) == 1
+        submissions = [body for method, path, body in fake.calls if method == "POST" and path == "/v1/experiments"]
+        assert len(submissions) == 1 and submissions[0]["target"]["overrides"] == {"system_prompt": s.candidate_prompt.text}
+        assert submissions[0]["concurrency"] == 1
+        aggregate = json.loads((dest / "aggregate-result.json").read_text())
+        metadata = json.loads((dest / "publication.json").read_text())
+        assert metadata["system_prompt_bindings"]["candidate_sha256"] == s.candidate_prompt.sha256
+        assert metadata["system_prompt_bindings"]["base_sha256"] == s.base_prompt.sha256
+        assert aggregate["experiment"]["target"]["prompt_sha256"] == s.candidate_prompt.sha256
+        assert len(comments.writes) == 1 and github.rows[0]["conclusion"] == ("neutral" if code == 0 else "failure")
+        for file in dest.iterdir():
+            assert s.candidate_prompt.text not in file.read_text() and s.base_prompt.text not in file.read_text()
+        s.reconcile_report = str(dest / "aggregate-result.json")
+        assert _real_run(s, tmp_path / "prompt-reconcile", verify=verify,
+            evaluate=lambda *_: pytest.fail("No new dispatch"), publish=comments.publish,
+            confirm=lambda _: None, check_publish=check) == code
+        assert len(dispatches) == 1
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize("field", ["reason", "name", "planning", "note", "scorer_note"])
+@pytest.mark.parametrize("encoding", ["plain", "json", "url"])
+def test_full_prompt_echo_refuses_all_public_surfaces(tmp_path, field, encoding):
+    s, _ = prompt_configured(tmp_path)
+    result = prompt_payload(s)
+    echo = s.candidate_prompt.text
+    if encoding == "json":
+        echo = json.dumps(echo)[1:-1]
+    elif encoding == "url":
+        echo = action.quote(echo, safe="")
+    if field == "reason":
+        result["reason"] = echo
+    elif field == "name":
+        result["experiment"]["name"] = echo
+    elif field == "planning":
+        result["experiment"]["progress"]["planning"]["text"] = echo
+    elif field == "note":
+        result["compare"]["note"] = echo
+    else:
+        result["compare"]["scorers"][0]["note"] = echo
+    checks, comments = [], Comments()
+    with pytest.raises(action.Refused):
+        _real_run(s, tmp_path / "prompt-leak", verify=lambda _: result["compare"]["base"],
+            evaluate=lambda *_: (0, result), confirm=lambda _: None, publish=comments.publish,
+            check_publish=lambda data, *a, **k: checks.append(data))
+    assert not comments.writes and checks == [None]
+    assert not (tmp_path / "prompt-leak/aggregate-result.json").exists()
+    assert not (tmp_path / "prompt-leak/evaluation.md").exists()
+    assert echo not in action.private_text(echo, s)
+
+
+@pytest.mark.parametrize("phase", ["before_cli", "snapshot", "reconcile"])
+def test_prompt_drift_after_planning_and_in_retained_binding_is_not_replaced(tmp_path, monkeypatch, phase):
+    s, env = prompt_configured(tmp_path)
+    calls = []
+    if phase == "before_cli":
+        Path(env["AQ_CI_BASE_SYSTEM_PROMPT_FILE"]).write_text("Changed base after planning")
+        monkeypatch.setattr(action.subprocess, "run", lambda *_a, **_k: calls.append("dispatch"))
+        with pytest.raises(action.Refused):
+            action.execute(s, tmp_path)
+        assert not calls
+    elif phase == "snapshot":
+        (tmp_path / "candidate-system-prompt.txt").symlink_to(env["AQ_CI_SYSTEM_PROMPT_FILE"])
+        monkeypatch.setattr(action.subprocess, "run", lambda *_a, **_k: calls.append("dispatch"))
+        with pytest.raises(action.Refused):
+            action.execute(s, tmp_path)
+        assert not calls
+    else:
+        result = prompt_payload(s)
+        aggregate = action.aggregate_result(result, prompt_bindings=True)
+        aggregate["compare"]["base"]["target"]["prompt_sha256"] = "0" * 64
+        retained = tmp_path / "substituted.json"
+        retained.write_text(json.dumps(aggregate))
+        s.reconcile_report = str(retained)
+        with pytest.raises(action.Refused):
+            _real_run(s, tmp_path / "substituted", verify=lambda _: result["compare"]["base"],
+                      evaluate=lambda *_: calls.append("dispatch"), check_publish=lambda *_: calls.append("check"))
+        assert not calls
+
+
+def test_prompt_file_symlink_parent_and_fifo_refuse_without_reading(tmp_path):
+    directory = tmp_path / "directory"
+    directory.mkdir()
+    (directory / "prompt").write_text("Fictional")
+    alias = tmp_path / "alias"
+    alias.symlink_to(directory, target_is_directory=True)
+    with pytest.raises(action.Refused):
+        action.read_prompt_file(str(alias / "prompt"))
+    fifo = tmp_path / "fifo"
+    os.mkfifo(fifo)
+    with pytest.raises(action.Refused):
+        action.read_prompt_file(str(fifo))
+
+
+def test_prompt_settings_hide_bytes_and_metadata_inputs_are_wired(tmp_path):
+    s, _ = prompt_configured(tmp_path)
+    assert s.candidate_prompt.text not in repr(s)
+    meta = yaml.safe_load((ROOT / ".github/actions/evaluate/action.yml").read_text())
+    for name, env in (("system-prompt-file", "AQ_CI_SYSTEM_PROMPT_FILE"),
+                      ("base-system-prompt-file", "AQ_CI_BASE_SYSTEM_PROMPT_FILE")):
+        assert meta["inputs"][name]["default"] == ""
+        assert meta["runs"]["steps"][-1]["env"][env] == "${{ inputs." + name + " }}"
+
+
+def test_no_prompt_selection_keeps_legacy_aggregate_without_digest(tmp_path):
+    s, result = configured(tmp_path), payload()
+    action.validate_result(result, 0, s)
+    aggregate = action.aggregate_result(result)
+    assert "prompt_sha256" not in aggregate["experiment"]["target"]
+    action.validate_result(aggregate, 0, s, public_projection=True)
+
+
+@pytest.mark.parametrize("overrides", [None, [], ["prompt"], "prompt", {"system_prompt": "Fictional candidate prompt.\n", "unexpected": None}])
+def test_malformed_or_unknown_null_override_refuses_with_fixed_error(tmp_path, overrides):
+    s, _ = prompt_configured(tmp_path)
+    result = prompt_payload(s)
+    result["experiment"]["target"]["overrides"] = overrides
+    with pytest.raises(action.Refused):
+        action.validate_result(result, 0, s)
+
+
+def test_prompt_full_estimate_effective_endpoint_mismatch_refuses_before_dispatch(tmp_path):
+    s, _ = prompt_configured(tmp_path)
+    fake, client = prompt_client(s)
+    fake.estimate_change = lambda target: target.update(effective_agent_endpoint="DifferentEndpoint")
+    calls = []
+    try:
+        with pytest.raises(action.Refused):
+            _real_run(s, tmp_path / "effective-endpoint-drift", verify=lambda settings: action.preflight(settings,
+                client=client, transport=httpx.MockTransport(CheckAPI())), evaluate=lambda *_: calls.append("dispatch"),
+                check_publish=lambda *_: {})
+    finally:
+        client.close()
+    assert calls == []
+    assert not any(method == "POST" and path == "/v1/experiments" for method, path, _ in fake.calls)
+
+
+@pytest.mark.parametrize("credential", ["AQ_API_KEY", "AQ_CI_GITHUB_TOKEN"])
+@pytest.mark.parametrize("encoding", ["raw", "html", "markdown", "url", "json"])
+def test_encoded_known_credential_prompt_refuses_before_hash_or_network(tmp_path, monkeypatch, credential, encoding):
+    _, env = prompt_configured(tmp_path)
+    secret = 'synthetic-only<&"\\token'
+    env[credential] = secret
+    encoded = {"raw": secret, "html": action.html.escape(secret), "markdown": report._markdown(secret),
+               "url": action.quote(secret, safe=""), "json": json.dumps(secret)[1:-1]}[encoding]
+    Path(env["AQ_CI_SYSTEM_PROMPT_FILE"]).write_text("Do not publish " + encoded)
+    monkeypatch.setattr(action.PromptFile, "sha256", property(lambda _: pytest.fail("No credential hash")))
+    with pytest.raises(action.Refused):
+        action.settings(env)
+
+
+@pytest.mark.parametrize("side", ["base", "experiment", "comparison_candidate", "planning"])
+@pytest.mark.parametrize("conflict", [None, "0" * 64])
+def test_native_producer_prompt_hash_conflict_refuses(tmp_path, side, conflict):
+    s, _ = prompt_configured(tmp_path)
+    result = json.loads(json.dumps(prompt_payload(s)))
+    if side == "planning":
+        fake, client = prompt_client(s)
+        fake.estimate_change = lambda target: target.update(prompt_sha256=conflict)
+        try:
+            with pytest.raises(action.Refused):
+                action.preflight(s, client=client, transport=httpx.MockTransport(CheckAPI()))
+        finally:
+            client.close()
+        assert not any(method == "POST" and path == "/v1/experiments" for method, path, _ in fake.calls)
+    else:
+        target = (result["compare"]["base"] if side == "base" else result["experiment"] if side == "experiment"
+                  else result["compare"]["candidate"])["target"]
+        target["prompt_sha256"] = conflict
+        with pytest.raises(action.Refused):
+            action.validate_result(result, 0, s)
+
+
+def test_native_prompt_digest_is_reused_without_parallel_target_field(tmp_path):
+    s, _ = prompt_configured(tmp_path)
+    result = prompt_payload(s)
+    for side in (result["experiment"], result["compare"]["base"], result["compare"]["candidate"]):
+        side["target"]["prompt_sha256"] = hashlib.sha256(side["target"]["overrides"]["system_prompt"].encode()).hexdigest()
+    action.validate_result(result, 0, s)
+    aggregate = action.aggregate_result(result, prompt_bindings=True)
+    assert aggregate["experiment"]["target"].get("prompt_sha256") == s.candidate_prompt.sha256
+    assert "system_prompt_sha256" not in aggregate["experiment"]["target"]
+    action.validate_result(aggregate, 0, s, public_projection=True)
+
+
+@pytest.mark.parametrize("role", ["candidate_prompt", "base_prompt"])
+@pytest.mark.parametrize("encoding", ["plain", "html", "json", "markdown", "url"])
+def test_trimmed_complete_prompt_echo_refuses_without_changing_execution_bytes(tmp_path, role, encoding):
+    s, _ = prompt_configured(tmp_path)
+    frozen = getattr(s, role)
+    original, digest = frozen.text, frozen.sha256
+    text = original.strip()
+    echo = {"plain": text, "html": action.html.escape(text), "json": json.dumps(text)[1:-1],
+            "markdown": report._markdown(text), "url": action.quote(text, safe="")}[encoding]
+    with pytest.raises(action.Refused):
+        action.guard_public_strings([echo], s)
+    assert echo not in action.private_text(echo, s)
+    assert frozen.text == original and frozen.sha256 == digest and original.endswith("\n")
+
+
+def test_partial_prompt_fragment_does_not_introduce_generic_redaction(tmp_path):
+    s, _ = prompt_configured(tmp_path)
+    action.guard_public_strings(["Fictional candidate"], s)
+    assert action.private_text("Fictional candidate", s) == "Fictional candidate"

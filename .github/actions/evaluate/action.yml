@@ -31,6 +31,12 @@ inputs:
   base-endpoint:
     description: Protected base-build AgentCore endpoint matching the baseline's persisted effective endpoint.
     required: true
+  system-prompt-file:
+    description: Optional trusted candidate UTF-8 LF prompt file. Requires base-system-prompt-file; both are frozen before preflight. Data only, not executed.
+    default: ''
+  base-system-prompt-file:
+    description: Optional protected-base UTF-8 LF prompt file matching the immutable baseline override. Requires system-prompt-file.
+    default: ''
   budget:
     description: Required metered USD budget, subject to existing server limits.
     required: true
@@ -102,6 +108,8 @@ runs:
         AQ_CI_BASELINE_EXPERIMENT: ${{ inputs.baseline-experiment }}
         AQ_CI_BASE_COMMIT: ${{ inputs.base-commit }}
         AQ_CI_BASE_ENDPOINT: ${{ inputs.base-endpoint }}
+        AQ_CI_SYSTEM_PROMPT_FILE: ${{ inputs.system-prompt-file }}
+        AQ_CI_BASE_SYSTEM_PROMPT_FILE: ${{ inputs.base-system-prompt-file }}
         AQ_CI_BUDGET: ${{ inputs.budget }}
         AQ_CI_GITHUB_TOKEN: ${{ inputs.github-token }}
         AQ_CI_PUBLISHER_ID: ${{ inputs.publisher-id }}

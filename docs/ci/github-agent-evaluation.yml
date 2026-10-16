@@ -85,8 +85,8 @@ jobs:
         uses: beyhangll/workbench-sdk/.github/actions/evaluate@REVIEWED_ACTION_COMMIT
         continue-on-error: true
         with:
-          endpoint: ${{ vars.AQ_ENDPOINT }}
-          ui-url: ${{ vars.AQ_UI_URL }}
+          endpoint: ${{ secrets.AQ_ENDPOINT }}
+          ui-url: ${{ secrets.AQ_UI_URL }}
           api-key: ${{ secrets.AQ_API_KEY }}
           target: ${{ vars.AQ_AGENT }}
           dataset: ${{ vars.AQ_DATASET }}

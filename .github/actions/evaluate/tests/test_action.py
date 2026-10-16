@@ -1629,6 +1629,8 @@ def test_default_example_is_plain_same_repository_and_pinned_without_pr_checkout
     assert step["with"]["github-token"] == "${{ github.token }}"
     assert "allow-forks" not in step["with"]
     assert step["with"]["publish-report-links"] is False
+    assert step["with"]["endpoint"] == "${{ secrets.AQ_ENDPOINT }}"
+    assert step["with"]["ui-url"] == "${{ secrets.AQ_UI_URL }}"
     metadata = yaml.safe_load((ROOT / ".github/actions/evaluate/action.yml").read_text())
     assert metadata["inputs"]["allow-forks"]["default"] == "false"
     assert metadata["inputs"]["publish-report-links"]["default"] == "true"

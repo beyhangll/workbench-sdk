@@ -105,8 +105,11 @@ base-branch access. Put the narrowly scoped build role in the deployment
 environment. Put `AQ_API_KEY` only in the evaluation environment. The example
 uses the built-in `GITHUB_TOKEN` with job-scoped `pull-requests: write` and
 `checks: write`, rather than requiring a new GitHub App. A separately supplied
-publisher token is also supported when approved and narrowly scoped. Supply trusted repository/environment variables for the API and UI
-addresses, connected agent, existing development dataset, budget, stable check
+publisher token is also supported when approved and narrowly scoped. The generic
+example reads API/UI addresses from protected `AQ_ENDPOINT` and `AQ_UI_URL`
+secrets, because ordinary variable values can appear in Action input logs before
+its runtime guard. Supply trusted repository/environment variables for the
+connected agent, existing development dataset, budget, stable check
 key and `AQ_COMMENT_PUBLISHER_ID`. Configure `AQ_CHECK_KEY` as a repository or
 organization variable, since workflow concurrency resolves before environment
 variables are available. The publisher ID must identify the author of

@@ -40,6 +40,25 @@ persisted experiments. They do not change the deployed agent's default prompt.
 This Git source pin is not a claim that `main`, a release tag or a package registry
 contains the same code.
 
+The [public sample](https://github.com/beyhangl/workbench-pr-check-sample) completed a separately approved 24-row round on 16 October 2026 with a genuine new baseline and unchanged prompt variants, scorers and references:
+
+| Change | Leading-total / contains passes | Owned evaluation check |
+| --- | --- | --- |
+| Protected baseline | 0/24 /24/24 | Protected control |
+| [Harmless prompt](https://github.com/beyhangl/workbench-pr-check-sample/pull/6) | 0/24 /24/24 | [Neutral](https://github.com/beyhangl/workbench-pr-check-sample/runs/117163400924) |
+| [Wrong-total prompt](https://github.com/beyhangl/workbench-pr-check-sample/pull/7) | 0/24 /16/24 | [Failure](https://github.com/beyhangl/workbench-pr-check-sample/runs/117164740582) |
+
+Both checks published real comments. The harmless workflow exited 0 without regression. The wrong-total workflow exited 1: contains had 8 paired losses and 0 gains, with an upper confidence bound about -0.01383. Leading-total had no baseline passes and supplied no regression evidence. No scorer, threshold or reference was weakened. A successful workflow or neutral check is not a qualification pass.
+
+All 72 target requests completed serially without reported execution errors, with 72 expected prompt-digest acknowledgements. No judge, title, reflection, replacement or automatic rerun was submitted. Reported token cost was $0.025605 for this round, or$0.034618 including the earlier 24 requests. Runtime charges, hidden usage and actual billing remain unknown. The $0.50 per-experiment metering and $1 observed-cost stop are not complete-billing guarantees.
+
+This is development evidence for the published SDK/Action contract. It does not establish release acceptance, complete accounting, independently attested deployment/model identity or general task quality. The existing zero-pass baseline limitation remains explicit. Separate development must-pass behavior is a product follow-up.
+
+<details>
+<summary>Original eight-row diagnostic, preserved without relabelling</summary>
+
+The following text records the original round and its then-current missing failing-check result. The later round above supersedes that delivery status, without changing the original outcomes.
+
 The [public sample](https://github.com/beyhangl/workbench-pr-check-sample)
 retains two actual DEFAULT-route checks from 16 October 2026:
 
@@ -58,6 +77,8 @@ The baseline and two candidates used 24 serial target requests in total, with no
 model-judge, title or reflection calls. Their reported token-cost subtotal was
 $0.009013. Runtime charges, hidden usage and actual billing remain unknown.
 The $0.50 per-experiment metered budget was not a complete billing cap.
+
+</details>
 
 ## License
 

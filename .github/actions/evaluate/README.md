@@ -1,11 +1,11 @@
 # Evaluate an AgentCore pull request
 
 This Action runs the existing `aq eval run` command once with an explicit
-AgentCore endpoint, tested commit, development row scope, current comparison,
+AgentCore endpoint, tested commit, development row scope, immutable baseline comparison,
 regression gate and required budget. Optional `task` accepts an existing task UUID,
 uses held-out row scope and adds the SDK's server-provided task acceptance gate.
 Without it, the development comparison remains unchanged. It publishes one aggregate comment through
-the SDK publisher. It does not deploy the customer's agent or change its defaults.
+the SDK publisher and a separately verified owned check. It does not deploy the customer's agent or change its defaults.
 HTTP targets are not supported by this interface.
 
 Pin this Action to a full reviewed commit that contains it. The installer refuses
@@ -25,7 +25,7 @@ Copy it into the customer's base branch and replace `REVIEWED_ACTION_COMMIT`.
 The template deliberately does not check out or execute PR code on either
 credential-bearing runner. The customer-owned CodeBuild project builds and
 deploys the requested branch remotely, with its own isolated permissions and no
-evaluation key or comment token. The evaluation runs in a different fresh runner.
+evaluation key or publisher token. The evaluation runs in a different fresh runner.
 Forks are refused by both the workflow and the Action.
 
 The customer must already own an approved branch-build project. Its deployment
@@ -36,9 +36,47 @@ evaluating. They remain pipeline declarations, not model or source attestation
 provided by the evaluation service. Cleanup of test endpoints and build artifacts
 belongs to that customer pipeline. Do not add evaluation credentials to it.
 
+The protected base-build handoff must supply `baseline-experiment`, `base-commit`
+and `base-endpoint`. Use an immutable experiment UUID selected by the
+owner-controlled pipeline, never a PR artifact, experiment name or `current`
+label. The Action confirms the authenticated PR head and base, the baseline's
+agent/dataset ownership and persisted effective AgentCore endpoint, complete
+attempt/scorer counts, and the selected row scope before dispatch. Without
+`task`, the scope is `development`; with a named task, both baseline and candidate
+must use `held_out`. Unknown scope, pinned row IDs and an unknown or include-all
+rejected-row policy are refused because this CLI cannot preserve those choices.
+
+The scorer-only estimate readback compares current resolved scorer settings,
+thresholds, trace requirements, judge routing and contextual connections against
+the frozen baseline. It does not execute a target or judge. An API without this
+readback refuses. The candidate reuses the baseline's dataset version, scorer IDs
+and repetitions. Changes detected in retained results still refuse publication.
+These controls bind saved records to pipeline declarations; they are not
+source/model attestation or complete billing evidence.
+
+The example requires protected `AQ_BASELINE_EXPERIMENT`,
+`AQ_BASE_DEPLOYED_COMMIT`, `AQ_BASE_AGENT_ENDPOINT` and `AQ_CHECK_APP_ID` values.
+The recorded base-build commit must match the current PR base SHA. When that SHA
+changes, the owner must provide a reviewed matching base-build record; this
+Action does not select or deploy a fresh baseline automatically.
+
+Set `check-app-id` to the trusted GitHub App owning checks, separately from the
+comment publisher user ID. Fully judged improvement produces `success`; fully
+judged no clear difference produces `neutral`. A regression, incomplete evidence
+or unconfirmed comment publication cannot produce success or neutral. GitHub can
+accept a neutral required check, so unknown measurement must remain nonpassing.
+
+Before success or neutral, the Action writes a nonpassing check and verifies its
+actual App ownership from GitHub. Only that verified lifecycle can then be
+completed. A failure needs at most one planned mutation; success or neutral needs
+at most two. Uncertain writes are reconciled with reads, never repeated blindly.
+Configure required-check ownership for that App in the customer repository.
+Actual sample-PR comment/check/regression acceptance remains a separate live
+integration requirement, not an outcome established by the offline tests.
+
 Configure the two protected environments with required reviewers and trusted
 base-branch access. Put the narrowly scoped build role in the deployment
-environment. Put `AQ_API_KEY` and `AQ_COMMENT_TOKEN` only in the evaluation
+environment. Put `AQ_API_KEY` and `AQ_CHECK_COMMENT_TOKEN` only in the evaluation
 environment. Supply trusted repository/environment variables for the API and UI
 addresses, connected agent, existing development dataset, budget, stable check
 key and `AQ_COMMENT_PUBLISHER_ID`. Configure `AQ_CHECK_KEY` as a repository or
@@ -50,7 +88,8 @@ not support `GET /user`. Use only the configured identity.
 
 The evaluation key needs `datasets:read`, `scorers:read`, `agents:read`,
 `experiments:read` and `experiments:write`. The separate repository token needs
-access to the intended PR and its issue comments. The examples do not grant
+access to the intended PR, its issue comments and check-run writes for the
+configured GitHub App. The examples do not grant
 repository permissions, mint credentials or configure environments. Those remain
 owner setup requirements. Protect the default workflow and pin third-party
 Actions. Do not run earlier untrusted commands on the evaluation runner.
@@ -84,7 +123,9 @@ customer checkout, inherited Python path or proxy configuration.
 
 Only `evaluation.md`, `aggregate-result.json` and `publication.json` are intended
 for the aggregate artifact. The JSON keeps the existing SDK result shape but
-only the fields used by its aggregate renderer and outcome gate. Renderer
+only the fields used by its aggregate renderer and outcome gate, including
+complete-attempt counters and the API's paired confidence bounds and alpha values.
+Malformed or missing bounds remain unknown. Renderer
 equivalence is checked before publication. Raw rows, answers, target settings and
 credentials are omitted. Both known credentials are checked before any public
 report is written or published. If a credential appears, publication is refused.
@@ -92,26 +133,29 @@ This known-secret check is not a general personal-data scanner. Choose appropria
 public experiment/scorer names and planning text.
 
 `evaluation-exit-code` retains the CLI outcome separately from
-`publication-status`. No clear difference is normal when every required scorer
+`publication-status` and `check-publication-status`. No clear difference is normal when every required scorer
 is complete and comparable. Missing, errored or incompatible evidence cannot
 pass. Publication success does not rescue a regression or incomplete evaluation.
-A successful evaluation with failed or uncertain publication fails the Action
+A successful evaluation with failed or uncertain comment/check publication fails the Action
 with exit 4. The original evaluation exit remains 0 in its metadata.
 
 The existing publisher attempts one create or update. It reconciles an uncertain
 write read-only and never sends an automatic second write. If publication is still
 uncertain, do not rerun ordinary evaluation/publication. Retain the three
 aggregate files and run this Action with `reconcile-report` pointing to the exact
-retained `aggregate-result.json`, the same commit, repository/PR and check key,
-and the trusted configured publisher ID. This mode skips evaluation and calls
-the SDK only with `reconcile_only=True`. An altered or cross-PR report cannot
-create a comment through that path. It remains unresolved unless its exact body
+retained `aggregate-result.json`, the same head/base commits, baseline UUID,
+repository/PR and check key, and the trusted configured publisher and App IDs.
+This mode skips evaluation and performs only reads to reconcile comments and
+checks. It calls the SDK publisher only with `reconcile_only=True`. An altered or
+cross-PR report cannot
+create a comment or check through that path. It remains unresolved unless its exact body
 matches the trusted publisher's existing comment.
 
 Never upload the sibling `*-private` directory or a broad runner/workspace glob.
 Use a fresh runner and discard private files according to the customer's approved
 retention policy after any required private investigation. The example retains
-only safe aggregates for seven days. Deleting local files does not delete the
+only safe aggregates for seven days. Existing older Action pins retain their old
+interface; adopting this version requires the explicit base inputs and App ID. Deleting local files does not delete the
 retained experiment in the evaluation service.
 
 Use the [direct-CLI GitLab template](../../../docs/ci/gitlab-agent-evaluation.yml)

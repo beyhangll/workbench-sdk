@@ -37,9 +37,11 @@ repository's `fork` metadata does not make the PR cross-repository.
 trusted contributors and owner review of workflow edits, immutable reviewed
 Action pins, and appropriately protected credential jobs/environments. An
 in-Action context guard cannot protect secrets already exposed by an earlier
-edited workflow step. Keep the fictional sample's job same-repository-only,
-with no PR checkout or PR execution, and a key restricted to the fictional
-workspace with its spend cap. This Action creates none of those protections.
+edited workflow step. For a fictional sample, keep the job same-repository-only with no PR checkout
+or PR execution, restrict its key to the approved fictional workspace, and use
+explicit per-run spending controls. Record the controls' actual enforcement and
+limitations; a working cost estimate is not a billing guarantee or proof of a
+per-key monetary cap. This Action creates none of those protections.
 
 The optional fork path requires `pull_request_target` and `allow-forks: true`
 in owner-controlled workflow configuration. It is accepted only for a known
@@ -165,8 +167,9 @@ This known-secret check is not a general personal-data scanner. Choose appropria
 public experiment/scorer names and planning text.
 
 `publish-report-links` defaults to `true` for existing integrations. Set it to
-`false` for a public report whose API/UI addresses must stay private; the inactive
-example and fictional sample use this mode. Supply private address values through
+`false` for a public report whose API/UI addresses must stay private. The inactive
+example selects this mode; other public callers with private addresses should
+also opt out. Supply private address values through
 protected secrets as well, so caller workflow logs do not disclose unmasked values. The validated original CLI result
 and restricted private debug record keep their real link. Only the public
 projection omits the top-level report link; all other rendered fields, outcome

@@ -52,6 +52,12 @@ inputs:
   timeout:
     description: Existing CLI scoring wait deadline in seconds, from 1 through 3600.
     default: '1800'
+  publish-report-links:
+    description: Include report links in public artifacts and comments. Set false for private API/UI hosts; remaining known address disclosure is refused, not redacted.
+    default: 'true'
+  allow-forks:
+    description: Explicit opt-in for cross-repository pull_request_target. Default pull_request supports same-repository PRs only. Requires owner-reviewed credential and workflow protections.
+    default: 'false'
   reconcile-report:
     description: Retained aggregate-result.json for read-only reconciliation. Skips evaluation and cannot write comments or checks.
     default: ''
@@ -103,4 +109,6 @@ runs:
         AQ_CI_CHECK_KEY: ${{ inputs.check-key }}
         AQ_CI_TIMEOUT: ${{ inputs.timeout }}
         AQ_CI_RECONCILE_REPORT: ${{ inputs.reconcile-report }}
+        AQ_CI_ALLOW_FORKS: ${{ inputs.allow-forks }}
+        AQ_CI_PUBLISH_REPORT_LINKS: ${{ inputs.publish-report-links }}
       run: '"$AQ_ACTION_PYTHON" -I "$AQ_ACTION_PATH/run.py"'

@@ -1,8 +1,10 @@
 # Customer template. This is not a workflow for this repository.
 # Pin the Action to a reviewed full implementation SHA.
+# Same-repository only; review workflow changes before granting this job credentials.
+# pull_request may use edited workflow code. Do not add PR checkout or PR commands.
 name: AQ evaluation
 on:
-  pull_request_target:
+  pull_request:
     types: [opened, synchronize, reopened]
 permissions: {}
 concurrency:
@@ -75,6 +77,8 @@ jobs:
     environment: agent-pr-evaluation
     permissions:
       contents: read
+      issues: write
+      checks: write
     steps:
       # No customer checkout, downloaded PR code, or build artifact enters this runner.
       - id: evaluation
@@ -94,7 +98,8 @@ jobs:
           baseline-experiment: ${{ vars.AQ_BASELINE_EXPERIMENT }}
           check-app-id: ${{ vars.AQ_CHECK_APP_ID }}
           budget: ${{ vars.AQ_BUDGET_USD }}
-          github-token: ${{ secrets.AQ_CHECK_COMMENT_TOKEN }}
+          github-token: ${{ github.token }}
+          publish-report-links: false
           publisher-id: ${{ vars.AQ_COMMENT_PUBLISHER_ID }}
           check-key: ${{ vars.AQ_CHECK_KEY }}
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

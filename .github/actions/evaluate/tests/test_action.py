@@ -37,10 +37,10 @@ BASE_SHA, BASE_ENDPOINT, APP_ID = "b" * 40, "base_build", 321
 
 def environment(tmp_path):
     event = {"pull_request": {"number": PR, "head": {"sha": SHA, "repo": {"full_name": REPO, "fork": False}},
-                              "base": {"sha": BASE_SHA, "repo": {"full_name": REPO}}}}
+                              "base": {"sha": BASE_SHA, "repo": {"full_name": REPO, "fork": False}}}}
     event_path = tmp_path / "event.json"
     event_path.write_text(json.dumps(event))
-    env = {"GITHUB_EVENT_NAME": "pull_request_target", "GITHUB_REPOSITORY": REPO,
+    env = {"GITHUB_EVENT_NAME": "pull_request", "GITHUB_REPOSITORY": REPO,
            "GITHUB_EVENT_PATH": str(event_path), "AQ_CI_COMMIT": SHA, "AQ_CI_AGENT_ENDPOINT": "pr_42",
            "AQ_CI_TARGET": "my-agent", "AQ_CI_DATASET": "weather", "AQ_CI_BUDGET": "1.25",
            "AQ_ENDPOINT": "https://evaluation.test", "AQ_API_KEY": API_KEY, "AQ_CI_GITHUB_TOKEN": COMMENT_TOKEN,
@@ -250,6 +250,8 @@ class CheckAPI:
         self.rows, self.writes = [], []
         self.timeout_after_delivery = self.unknown_delivery = False
         self.base_sha, self.head_sha = BASE_SHA, SHA
+        self.head_repository, self.base_repository = REPO, REPO
+        self.head_repository_is_fork = self.base_repository_is_fork = False
         self.actual_app_id = APP_ID
 
     def __call__(self, req):
@@ -257,8 +259,8 @@ class CheckAPI:
         assert API_KEY not in str(req.headers) and API_KEY not in req.content.decode()
         if req.url.path.endswith('/pulls/42'):
             return httpx.Response(200, json={"number": PR,
-                "head": {"sha": self.head_sha, "repo": {"full_name": REPO, "fork": False}},
-                "base": {"sha": self.base_sha, "repo": {"full_name": REPO}}})
+                "head": {"sha": self.head_sha, "repo": {"full_name": self.head_repository, "fork": self.head_repository_is_fork}},
+                "base": {"sha": self.base_sha, "repo": {"full_name": self.base_repository, "fork": self.base_repository_is_fork}}})
         if req.method == 'GET':
             return httpx.Response(200, json={"total_count": len(self.rows), "check_runs": self.rows})
         self.writes.append(req)
@@ -810,7 +812,7 @@ def test_bad_context_refuses_before_any_execution(tmp_path, mutation):
     if mutation == "fork": event["pull_request"]["head"]["repo"]["fork"] = True
     if mutation == "unknown_fork": event["pull_request"]["head"]["repo"].pop("fork")
     if mutation == "repo": event["pull_request"]["head"]["repo"]["full_name"] = "other/repository"
-    if mutation == "event": env["GITHUB_EVENT_NAME"] = "pull_request"
+    if mutation == "event": env["GITHUB_EVENT_NAME"] = "workflow_dispatch"
     if mutation == "commit": env["AQ_CI_COMMIT"] = "b" * 40
     if mutation == "endpoint": env["AQ_CI_AGENT_ENDPOINT"] = "https://untrusted.test"
     if mutation == "budget": env["AQ_CI_BUDGET"] = "NaN"
@@ -1059,7 +1061,7 @@ def test_templates_keep_trusted_context_serialization_and_artifact_boundaries():
     assert step["with"]["base-commit"] == "${{ vars.AQ_BASE_DEPLOYED_COMMIT }}"
     assert step["with"]["base-endpoint"] == "${{ vars.AQ_BASE_AGENT_ENDPOINT }}"
     assert step["with"]["check-app-id"] == "${{ vars.AQ_CHECK_APP_ID }}"
-    assert step["with"]["github-token"] == "${{ secrets.AQ_CHECK_COMMENT_TOKEN }}"
+    assert step["with"]["github-token"] == "${{ github.token }}"
     assert step["uses"].endswith("@REVIEWED_ACTION_COMMIT")
     artifact = evaluate["steps"][1]["with"]["path"]
     assert artifact.count("report-dir") == 3 and "private" not in artifact and "*" not in artifact
@@ -1462,3 +1464,320 @@ def test_task_binding_keeps_nonempty_owner_requirement(tmp_path, owner):
     result["task"][owner] = result["experiment"][owner] = None
     with pytest.raises(action.Refused, match="task, agent and dataset"):
         action.validate_result(result, 0, s)
+
+
+FOREIGN_REPO = "contributor/fictional-repository"
+
+
+def source_environment(tmp_path, event_name="pull_request", head_repository=REPO,
+                       head_fork=False, base_fork=False, opt_in=None):
+    env, event = environment(tmp_path)
+    env["GITHUB_EVENT_NAME"] = event_name
+    if opt_in is not None:
+        env["AQ_CI_ALLOW_FORKS"] = opt_in
+    event["pull_request"]["head"]["repo"].update(full_name=head_repository, fork=head_fork)
+    event["pull_request"]["base"]["repo"]["fork"] = base_fork
+    Path(env["GITHUB_EVENT_PATH"]).write_text(json.dumps(event))
+    return env
+
+
+@pytest.mark.parametrize("event_name,head_repository,head_fork,base_fork,opt_in,allowed", [
+    ("pull_request", REPO, False, False, None, True),
+    ("pull_request", REPO, True, True, None, True),
+    ("pull_request", REPO, False, False, "true", True),
+    ("pull_request", FOREIGN_REPO, True, False, None, False),
+    ("pull_request", FOREIGN_REPO, True, False, "true", False),
+    ("pull_request_target", FOREIGN_REPO, True, False, None, False),
+    ("pull_request_target", FOREIGN_REPO, True, False, "false", False),
+    ("pull_request_target", FOREIGN_REPO, True, False, "true", True),
+    ("pull_request_target", FOREIGN_REPO, False, True, "true", True),
+    ("pull_request_target", REPO, False, False, None, False),
+    ("pull_request_target", REPO, False, False, "true", False),
+    ("pull_request", REPO, True, False, None, False),
+    ("push", REPO, False, False, "true", False),
+    ("workflow_dispatch", REPO, False, False, "true", False),
+])
+def test_pr_event_policy(tmp_path, event_name, head_repository, head_fork, base_fork, opt_in, allowed):
+    env = source_environment(tmp_path, event_name, head_repository, head_fork, base_fork, opt_in)
+    env["GITHUB_SHA"] = "c" * 40  # pull_request uses a merge SHA; this is not the tested head.
+    if not allowed:
+        with pytest.raises(action.Refused):
+            action.settings(env)
+        return
+    s = action.settings(env)
+    assert s.commit == SHA and s.base_commit == BASE_SHA
+    assert s.head_repository == head_repository
+    assert s.head_repository_is_fork is head_fork
+    assert s.base_repository_is_fork is base_fork
+
+
+@pytest.mark.parametrize("value", ["", "yes", "1", "TRUE", " true "])
+def test_fork_opt_in_is_an_explicit_strict_boolean(tmp_path, value):
+    env = source_environment(tmp_path, "pull_request_target", FOREIGN_REPO, True, False, value)
+    with pytest.raises(action.Refused):
+        action.settings(env)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("head_fork", None), ("head_fork", 0), ("head_fork", "false"),
+    ("base_fork", None), ("base_fork", 0), ("base_fork", "false"),
+    ("head_repository", None), ("head_repository", "owner/repo/extra"),
+    ("head_repository", "owner/.."), ("head_repository", ""),
+])
+def test_unknown_or_malformed_pr_source_refuses_before_credential_use(tmp_path, field, value):
+    env = source_environment(tmp_path, **{field: value})
+    class PrivateCredentials(dict):
+        def get(self, key, *args):
+            assert key not in ("AQ_API_KEY", "AQ_CI_GITHUB_TOKEN")
+            return super().get(key, *args)
+        def __getitem__(self, key):
+            assert key not in ("AQ_API_KEY", "AQ_CI_GITHUB_TOKEN")
+            return super().__getitem__(key)
+    with pytest.raises(action.Refused):
+        action.settings(PrivateCredentials(env))
+
+
+def configured_source(tmp_path, cross_repository=False, fork_hosted=False):
+    s = action.settings(source_environment(tmp_path,
+        "pull_request_target" if cross_repository else "pull_request",
+        FOREIGN_REPO if cross_repository else REPO,
+        cross_repository or fork_hosted, fork_hosted, "true" if cross_repository else None))
+    github = CheckAPI()
+    github.head_repository = s.head_repository
+    github.head_repository_is_fork = s.head_repository_is_fork
+    github.base_repository_is_fork = s.base_repository_is_fork
+    return s, github
+
+
+@pytest.mark.parametrize("cross_repository", [False, True])
+@pytest.mark.parametrize("field,value", [
+    ("head_repository", "different/fictional-repository"), ("base_repository", "different/base"),
+    ("head_repository_is_fork", None), ("head_repository_is_fork", "false"),
+    ("base_repository_is_fork", None), ("base_repository_is_fork", True),
+    ("head_sha", "c" * 40), ("base_sha", "c" * 40),
+])
+def test_actual_source_drift_refuses_before_evaluation(tmp_path, cross_repository, field, value):
+    s, github = configured_source(tmp_path, cross_repository)
+    setattr(github, field, value)
+    fake, client = baseline_client()
+    try:
+        with pytest.raises(action.Refused):
+            action.preflight(s, client=client, transport=httpx.MockTransport(github))
+    finally:
+        client.close()
+    assert fake.calls == [] and github.writes == []
+
+
+@pytest.mark.parametrize("cross_repository", [False, True])
+@pytest.mark.parametrize("reconcile", [False, True])
+def test_source_identity_drift_blocks_publication_and_reconcile(tmp_path, cross_repository, reconcile):
+    s, github = configured_source(tmp_path, cross_repository)
+    fake, client = baseline_client()
+    comments, submissions = Comments(), []
+    if reconcile:
+        retained = tmp_path / "retained.json"
+        retained.write_text(json.dumps(action.aggregate_result(payload())))
+        s.reconcile_report = str(retained)
+        github.head_repository = "different/fictional-repository"
+    def evaluate(*_):
+        submissions.append("one")
+        github.head_repository = "different/fictional-repository"
+        return 0, payload()
+    try:
+        with pytest.raises(action.Refused):
+            _real_run(s, tmp_path / "drift",
+                verify=lambda settings: action.preflight(settings, client=client, transport=httpx.MockTransport(github)),
+                evaluate=evaluate, publish=comments.publish,
+                confirm=lambda settings: action.confirm_context(settings, transport=httpx.MockTransport(github)),
+                check_publish=lambda result, settings, **kw: action.publish_check(result, settings,
+                    transport=httpx.MockTransport(github), **kw))
+    finally:
+        client.close()
+    assert submissions == ([] if reconcile else ["one"])
+    assert not comments.writes and not github.writes
+
+
+@pytest.mark.parametrize("cross_repository,fork_hosted", [(False, False), (False, True), (True, False)])
+def test_known_source_preflight_and_owned_check_stay_on_base_repository(tmp_path, cross_repository, fork_hosted):
+    s, github = configured_source(tmp_path, cross_repository, fork_hosted)
+    fake, client = baseline_client()
+    try:
+        assert action.preflight(s, client=client, transport=httpx.MockTransport(github)) == fake.base
+        checked = action.publish_check(action.aggregate_result(payload()), s, transport=httpx.MockTransport(github))
+    finally:
+        client.close()
+    assert checked["conclusion"] == "neutral" and len(github.writes) == 2
+    assert all(req.url.path.startswith("/repos/" + REPO + "/") for req in github.writes)
+    assert json.loads(github.writes[0].content)["conclusion"] == "failure"
+
+
+def test_default_example_is_plain_same_repository_and_pinned_without_pr_checkout():
+    path = ROOT / "docs/ci/github-agent-evaluation.yml"
+    text = path.read_text()
+    raw = yaml.load(text, Loader=yaml.BaseLoader)
+    assert set(raw["on"]) == {"pull_request"}
+    parsed = yaml.safe_load(text)
+    deploy, evaluate = parsed["jobs"].values()
+    for job in (deploy, evaluate):
+        assert job["if"] == "github.event.pull_request.head.repo.full_name == github.repository"
+        assert not any("checkout" in step.get("uses", "") for step in job["steps"])
+    assert evaluate["permissions"]["checks"] == "write"
+    assert evaluate["permissions"]["issues"] == "write"
+    step = evaluate["steps"][0]
+    assert step["uses"].endswith("@REVIEWED_ACTION_COMMIT")
+    assert step["with"]["github-token"] == "${{ github.token }}"
+    assert "allow-forks" not in step["with"]
+    assert step["with"]["publish-report-links"] is False
+    metadata = yaml.safe_load((ROOT / ".github/actions/evaluate/action.yml").read_text())
+    assert metadata["inputs"]["allow-forks"]["default"] == "false"
+    assert metadata["inputs"]["publish-report-links"]["default"] == "true"
+    assert metadata["runs"]["steps"][-1]["env"]["AQ_CI_ALLOW_FORKS"] == "${{ inputs.allow-forks }}"
+
+
+PRIVATE_UI = "https://private-ui.example.test/workbench"
+PRIVATE_UI_HOST = "private-ui.example.test"
+
+
+def private_reporting(tmp_path):
+    env = source_environment(tmp_path)
+    env["AQ_UI_URL"] = PRIVATE_UI
+    env["AQ_CI_PUBLISH_REPORT_LINKS"] = "false"
+    return action.settings(env)
+
+
+@pytest.mark.parametrize("code,verdict", [(0, "no_clear_difference"), (1, "regression")])
+def test_private_link_projection_preserves_original_and_every_other_report_field(tmp_path, code, verdict):
+    s, original = private_reporting(tmp_path), payload(code, verdict)
+    original["link"] = PRIVATE_UI + "/#/comparison"
+    before = json.loads(json.dumps(original))
+    projected = action.aggregate_result(original, publish_report_links=s.publish_report_links)
+    expected = {key: value for key, value in original.items() if key != "link"}
+    assert original == before and "link" not in projected
+    assert report.pr_summary(projected) == report.pr_summary(expected)
+    assert projected["exit_code"] == code and projected["verdict"] == verdict
+    action.validate_result(projected, code, s)
+    comments, github = Comments(), CheckAPI()
+    assert run(s, tmp_path / "private-links", evaluate=lambda *_: (code, original), publish=comments.publish,
+        check_publish=lambda data, settings, **kw: action.publish_check(data, settings,
+            transport=httpx.MockTransport(github), **kw)) == code
+    assert original == before and len(comments.writes) == 1
+    public = "\n".join(p.read_text() for p in (tmp_path / "private-links").iterdir())
+    assert PRIVATE_UI_HOST not in public and "evaluation.test" not in public
+
+
+@pytest.mark.parametrize("value,allowed", [(None, True), ("true", True), ("false", True),
+    ("", False), ("TRUE", False), ("0", False), (" false ", False), ("yes", False)])
+def test_public_report_links_option_is_strict_and_backward_compatible(tmp_path, value, allowed):
+    env = source_environment(tmp_path)
+    if value is not None:
+        env["AQ_CI_PUBLISH_REPORT_LINKS"] = value
+    if not allowed:
+        with pytest.raises(action.Refused):
+            action.settings(env)
+        return
+    s = action.settings(env)
+    assert s.publish_report_links is (value != "false")
+    if s.publish_report_links:
+        result = payload()
+        assert action.aggregate_result(result)["link"] == result["link"]
+        assert "evaluation.test" in action.public_body(action.aggregate_result(result), s)
+
+
+@pytest.mark.parametrize("encoded", [
+    PRIVATE_UI_HOST, PRIVATE_UI_HOST.upper(), PRIVATE_UI_HOST.replace(".", "%2E"),
+    PRIVATE_UI_HOST.replace(".", "&#46;"), "private-ui\\.example\\.test",
+    "\\u0070rivate-ui.example.test", "https%3A%2F%2Fprivate-ui.example.test%2Fworkbench",
+    "https://evaluation.test", "https%3A%2F%2Fevaluation.test",
+])
+@pytest.mark.parametrize("location", ["reason", "nested_key", "planning"])
+def test_private_addresses_in_remaining_public_fields_refuse_without_redaction(tmp_path, encoded, location):
+    s, result = private_reporting(tmp_path), payload()
+    if location == "reason":
+        result["exit_code"] = 3
+        result["experiment"]["status"] = "failed"
+        result["reason"] = "Synthetic connection failure at " + encoded
+    elif location == "nested_key":
+        result["compare"]["driven_by"] = {encoded: "synthetic hint"}
+    else:
+        result["experiment"]["progress"]["planning"]["text"] = "Synthetic note: " + encoded
+    before = json.loads(json.dumps(result))
+    comments, github = Comments(), CheckAPI()
+    out = tmp_path / "refused-host"
+    with pytest.raises(action.Refused):
+        run(s, out, evaluate=lambda *_: (result["exit_code"], result), publish=comments.publish,
+            check_publish=lambda data, settings, **kw: action.publish_check(data, settings,
+                transport=httpx.MockTransport(github), **kw))
+    assert result == before and not comments.writes
+    assert not (out / "aggregate-result.json").exists() and not (out / "evaluation.md").exists()
+    assert len(github.writes) == 1 and github.rows[0]["conclusion"] == "failure"
+    assert PRIVATE_UI_HOST not in json.dumps(github.rows) and "evaluation.test" not in json.dumps(github.rows)
+    assert "not be judged" in github.rows[0]["output"]["summary"]
+
+
+def test_private_address_in_check_key_cannot_leak_through_refusal_check(tmp_path):
+    s, result = private_reporting(tmp_path), payload()
+    s.check_key = PRIVATE_UI_HOST
+    comments, github = Comments(), CheckAPI()
+    with pytest.raises(action.Refused):
+        run(s, tmp_path / "private-key", evaluate=lambda *_: (0, result), publish=comments.publish,
+            check_publish=lambda data, settings, **kw: action.publish_check(data, settings,
+                transport=httpx.MockTransport(github), **kw))
+    assert not comments.writes and not github.writes
+    assert not (tmp_path / "private-key/aggregate-result.json").exists()
+
+
+def test_private_report_reconciliation_stays_read_only(tmp_path):
+    s, result = private_reporting(tmp_path), payload()
+    result["link"] = PRIVATE_UI + "/#/comparison"
+    comments, github = Comments(), CheckAPI()
+    def check(data, settings, **kw):
+        return action.publish_check(data, settings, transport=httpx.MockTransport(github), **kw)
+    assert run(s, tmp_path / "initial", evaluate=lambda *_: (0, result), publish=comments.publish, check_publish=check) == 0
+    comments.writes.clear()
+    github.writes.clear()
+    s.reconcile_report = str(tmp_path / "initial/aggregate-result.json")
+    assert run(s, tmp_path / "reconciled", evaluate=lambda *_: pytest.fail("Never redispatch"),
+               publish=comments.publish, check_publish=check) == 0
+    assert not comments.writes and not github.writes
+    retained = json.loads(Path(s.reconcile_report).read_text())
+    retained["reason"] = PRIVATE_UI_HOST
+    tainted = tmp_path / "tainted.json"
+    tainted.write_text(json.dumps(retained))
+    s.reconcile_report = str(tainted)
+    with pytest.raises(action.Refused):
+        run(s, tmp_path / "tainted-reconcile", evaluate=lambda *_: pytest.fail("Never redispatch"),
+            publish=comments.publish, check_publish=check)
+    assert not comments.writes and not github.writes
+
+
+def test_actual_cli_keeps_private_link_only_in_original_debug_record(tmp_path, monkeypatch):
+    s = private_reporting(tmp_path)
+    fake, old_client = baseline_client()
+    old_client.close()
+    fake.compare["base"], fake.compare["candidate"] = fake.base, fake.result
+    fake.result["progress"].update(row_scope="development", include_rejected=False)
+    client = Client(Config(None, API_KEY, s.endpoint, s.ui_url), transport=httpx.MockTransport(fake), sleep=lambda _: None)
+    comments, github, dispatches = Comments(), CheckAPI(), []
+    def process(args, **kwargs):
+        dispatches.append(args)
+        out, err = io.StringIO(), io.StringIO()
+        code = cli.main(args[4:], out=out, err=err, client=client)
+        return SimpleNamespace(returncode=code, stdout=out.getvalue(), stderr=err.getvalue())
+    monkeypatch.setattr(action.subprocess, "run", process)
+    try:
+        actual = _real_run(s, tmp_path / "cli-private",
+            verify=lambda settings: action.preflight(settings, client=client, transport=httpx.MockTransport(github)),
+            publish=comments.publish,
+            confirm=lambda settings: action.confirm_context(settings, transport=httpx.MockTransport(github)),
+            check_publish=lambda data, settings, **kw: action.publish_check(data, settings,
+                transport=httpx.MockTransport(github), **kw))
+    finally:
+        client.close()
+    assert actual == 0 and len(dispatches) == 1
+    original = json.loads((tmp_path / "cli-private-private/result.redacted.private.json").read_text())
+    public = json.loads((tmp_path / "cli-private/aggregate-result.json").read_text())
+    assert PRIVATE_UI_HOST in original["link"] and "link" not in public
+    assert original["exit_code"] == public["exit_code"] == 0
+    assert sum(method == "POST" and path == "/v1/experiments" for method, path, _ in fake.calls) == 1
+    assert PRIVATE_UI_HOST not in json.dumps(public)
+    assert PRIVATE_UI_HOST not in json.dumps(github.rows) and len(comments.writes) == 1

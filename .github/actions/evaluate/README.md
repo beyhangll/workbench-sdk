@@ -6,7 +6,9 @@ regression gate and required budget. Optional `task` accepts an existing task UU
 uses held-out row scope and adds the SDK's server-provided task acceptance gate.
 Without it, the development comparison remains unchanged. It publishes one aggregate comment through
 the SDK publisher and a separately verified owned check. It does not deploy the customer's agent or change its defaults.
-HTTP targets are not supported by this interface.
+HTTP targets are not supported by this interface. Same-repository PRs use plain
+`pull_request` by default; cross-repository `pull_request_target` is an explicit
+`allow-forks: true` opt-in, not the default trust policy.
 
 Pin this Action to a full reviewed commit that contains it. The installer refuses
 mutable branches or tags. It installs `packages/aq-sdk` from that same Action
@@ -22,11 +24,35 @@ credentials, protected CI configuration and deployment remain separate setup.
 
 Use the [complete GitHub template](../../../docs/ci/github-agent-evaluation.yml).
 Copy it into the customer's base branch and replace `REVIEWED_ACTION_COMMIT`.
-The template deliberately does not check out or execute PR code on either
-credential-bearing runner. The customer-owned CodeBuild project builds and
+The template uses `pull_request`, restricts both jobs to same-repository PRs,
+and does not check out or execute PR code on either credential-bearing runner. The customer-owned CodeBuild project builds and
 deploys the requested branch remotely, with its own isolated permissions and no
 evaluation key or publisher token. The evaluation runs in a different fresh runner.
-Forks are refused by both the workflow and the Action.
+Cross-repository PRs are refused by the default template and Action policy.
+A repository that is itself a fork can still have a same-repository PR; that
+repository's `fork` metadata does not make the PR cross-repository.
+
+**Same-repository is not proof that workflow code is immutable.** A plain
+`pull_request` workflow can use the PR's merge-branch workflow definition. Use
+trusted contributors and owner review of workflow edits, immutable reviewed
+Action pins, and appropriately protected credential jobs/environments. An
+in-Action context guard cannot protect secrets already exposed by an earlier
+edited workflow step. Keep the fictional sample's job same-repository-only,
+with no PR checkout or PR execution, and a key restricted to the fictional
+workspace with its spend cap. This Action creates none of those protections.
+
+The optional fork path requires `pull_request_target` and `allow-forks: true`
+in owner-controlled workflow configuration. It is accepted only for a known
+cross-repository head. It is not permission to run untrusted fork code with
+credentials: no fork checkout, downloaded executable artifact or PR-controlled
+command belongs on that runner. Review GitHub's event policy, permissions,
+protected environment and isolated deployment handoff before enabling it.
+The supplied default template does not provision a fork build or enable that
+mode. Opt-in grants no extra key, spending, endpoint or repository permission.
+Both modes freeze head/base SHAs, head/base repository identity and their known
+fork metadata, then recheck the exact authenticated GitHub context before
+dispatch and publication. The tested source is `pull_request.head.sha`, not the
+`GITHUB_SHA` merge commit used by a plain PR workflow.
 
 The customer must already own an approved branch-build project. Its deployment
 must preserve the connected runtime's default and expose a dedicated test
@@ -76,13 +102,16 @@ integration requirement, not an outcome established by the offline tests.
 
 Configure the two protected environments with required reviewers and trusted
 base-branch access. Put the narrowly scoped build role in the deployment
-environment. Put `AQ_API_KEY` and `AQ_CHECK_COMMENT_TOKEN` only in the evaluation
-environment. Supply trusted repository/environment variables for the API and UI
+environment. Put `AQ_API_KEY` only in the evaluation environment. The example
+uses the built-in `GITHUB_TOKEN` with job-scoped `issues: write` and
+`checks: write`, rather than requiring a new GitHub App. A separately supplied
+publisher token is also supported when approved and narrowly scoped. Supply trusted repository/environment variables for the API and UI
 addresses, connected agent, existing development dataset, budget, stable check
 key and `AQ_COMMENT_PUBLISHER_ID`. Configure `AQ_CHECK_KEY` as a repository or
 organization variable, since workflow concurrency resolves before environment
 variables are available. The publisher ID must identify the author of
-comments made with the configured token. Never derive it from `GITHUB_ACTOR_ID`,
+comments made with the configured token; for `GITHUB_TOKEN`, configure its
+verified GitHub Actions bot identity and App identity separately. Never derive it from `GITHUB_ACTOR_ID`,
 PR text, existing comments or a downloaded artifact. Installation tokens need
 not support `GET /user`. Use only the configured identity.
 
@@ -104,7 +133,7 @@ A composite Action cannot declare job-level concurrency. Different integration
 workflows that publish the same check must use the same group. A local lock or a
 self-declared flag does not establish cross-run serialization.
 
-GitHub documents the trust boundary and why executing PR code in a privileged
+GitHub documents why executing PR code in a privileged
 job is unsafe in [Securely using pull_request_target](https://docs.github.com/en/actions/reference/security/securely-using-pull_request_target).
 The customer must satisfy any applicable event policy. This artifact does not
 change or bypass that policy. The branch-build step uses the existing
@@ -132,6 +161,22 @@ report is written or published. If a credential appears, publication is refused.
 This known-secret check is not a general personal-data scanner. Choose appropriate
 public experiment/scorer names and planning text.
 
+`publish-report-links` defaults to `true` for existing integrations. Set it to
+`false` for a public report whose API/UI addresses must stay private; the inactive
+example and fictional sample use this mode. Supply private address values through
+protected secrets as well, so caller workflow logs do not disclose unmasked values. The validated original CLI result
+and restricted private debug record keep their real link. Only the public
+projection omits the top-level report link; all other rendered fields, outcome
+and gate evidence must remain equivalent. It does not invent a public UI URL or
+redact arbitrary error text into a passing report.
+
+In that mode, known API/UI addresses and hostnames are checked across remaining
+public JSON keys/values, Markdown, the generated comment marker and check name,
+including common encoded/escaped forms. If any remain, aggregate artifacts and
+comment publication are refused. The existing generic failure check is the only
+permitted fallback, and even its name must pass that guard. This is a bounded
+known-address check, not a general personal-data or arbitrary-obfuscation scanner.
+
 `evaluation-exit-code` retains the CLI outcome separately from
 `publication-status` and `check-publication-status`. No clear difference is normal when every required scorer
 is complete and comparable. Missing, errored or incompatible evidence cannot
@@ -145,8 +190,9 @@ uncertain, do not rerun ordinary evaluation/publication. Retain the three
 aggregate files and run this Action with `reconcile-report` pointing to the exact
 retained `aggregate-result.json`, the same head/base commits, baseline UUID,
 repository/PR and check key, and the trusted configured publisher and App IDs.
-This mode skips evaluation and performs only reads to reconcile comments and
-checks. It calls the SDK publisher only with `reconcile_only=True`. An altered or
+Keep the same report-link privacy mode. This mode skips evaluation and performs
+only reads to reconcile comments and checks, with the exact PR source identity
+still rechecked. It calls the SDK publisher only with `reconcile_only=True`. An altered or
 cross-PR report cannot
 create a comment or check through that path. It remains unresolved unless its exact body
 matches the trusted publisher's existing comment.
@@ -155,7 +201,8 @@ Never upload the sibling `*-private` directory or a broad runner/workspace glob.
 Use a fresh runner and discard private files according to the customer's approved
 retention policy after any required private investigation. The example retains
 only safe aggregates for seven days. Existing older Action pins retain their old
-interface; adopting this version requires the explicit base inputs and App ID. Deleting local files does not delete the
+interface; adopting this version requires the explicit base inputs and App ID
+and the selected event policy. Same-repository callers must use `pull_request`. Deleting local files does not delete the
 retained experiment in the evaluation service.
 
 Use the [direct-CLI GitLab template](../../../docs/ci/gitlab-agent-evaluation.yml)

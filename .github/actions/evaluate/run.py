@@ -14,7 +14,7 @@ import subprocess
 import sys
 import tempfile
 from typing import Callable
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 import httpx
 
@@ -58,12 +58,21 @@ class Settings:
     base_endpoint: str
     baseline_experiment: str
     check_app_id: int
+    head_repository: str
+    head_repository_is_fork: bool
+    base_repository_is_fork: bool
+    publish_report_links: bool
     task: str = ""
 
 
 def settings(env: dict[str, str]) -> Settings:
-    if env.get("GITHUB_EVENT_NAME") != "pull_request_target":
-        raise Refused("Use a trusted base-branch pull_request_target workflow with separate credential-bearing jobs.")
+    event_name = env.get("GITHUB_EVENT_NAME")
+    allow_forks = env.get("AQ_CI_ALLOW_FORKS", "false")
+    publish_report_links = env.get("AQ_CI_PUBLISH_REPORT_LINKS", "true")
+    if publish_report_links not in ("false", "true"):
+        raise Refused("The publish-report-links input must be exactly true or false.")
+    if event_name not in ("pull_request", "pull_request_target") or allow_forks not in ("false", "true"):
+        raise Refused("Use same-repository pull_request by default, or explicitly opt in to cross-repository pull_request_target.")
     try:
         event = json.loads(Path(env["GITHUB_EVENT_PATH"]).read_text())
         pr = event["pull_request"]
@@ -73,9 +82,21 @@ def settings(env: dict[str, str]) -> Settings:
         base_sha = pr["base"]["sha"]
         if not re.fullmatch(r"[A-Za-z0-9-]{1,39}/[A-Za-z0-9_.-]{1,100}", repository) or repository.split('/')[1] in ('.', '..'):
             raise ValueError
-        same_repo = pr["head"]["repo"]["full_name"] == pr["base"]["repo"]["full_name"] == repository
-        if not same_repo or pr["head"]["repo"].get("fork") is not False:
-            raise Refused("Fork and unknown-repository pull requests cannot use evaluation or publication credentials.")
+        head_repository = pr["head"]["repo"]["full_name"]
+        head_repository_is_fork = pr["head"]["repo"].get("fork")
+        base_repository_is_fork = pr["base"]["repo"].get("fork")
+        if (pr["base"]["repo"]["full_name"] != repository
+                or not isinstance(head_repository, str)
+                or not re.fullmatch(r"[A-Za-z0-9-]{1,39}/[A-Za-z0-9_.-]{1,100}", head_repository)
+                or head_repository.split("/")[1] in (".", "..")
+                or type(head_repository_is_fork) is not bool or type(base_repository_is_fork) is not bool):
+            raise Refused("The pull-request source repository or fork metadata is unknown or invalid.")
+        same_repo = head_repository == repository
+        if same_repo and head_repository_is_fork is not base_repository_is_fork:
+            raise Refused("The same repository has contradictory fork metadata.")
+        if not ((event_name == "pull_request" and same_repo)
+                or (event_name == "pull_request_target" and allow_forks == "true" and not same_repo)):
+            raise Refused("Same-repository PRs require pull_request; cross-repository pull_request_target requires explicit opt-in.")
         if type(number) is not int or number <= 0 or not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", sha):
             raise ValueError
         commit = env["AQ_CI_COMMIT"].strip()
@@ -128,7 +149,8 @@ def settings(env: dict[str, str]) -> Settings:
                         str(budget), api, env.get("AQ_UI_URL", "").strip() or api, env["AQ_API_KEY"],
                         env["AQ_CI_GITHUB_TOKEN"], publisher_id, key, timeout,
                         env.get("AQ_CI_RECONCILE_REPORT", "").strip(), base_sha.lower(), base_endpoint,
-                        baseline.lower(), check_app_id, task)
+                        baseline.lower(), check_app_id, head_repository, head_repository_is_fork,
+                        base_repository_is_fork, publish_report_links == "true", task)
     except Refused:
         raise
     except (KeyError, TypeError, ValueError, OSError, InvalidOperation):
@@ -197,8 +219,10 @@ def trusted_pr(s: Settings, client: httpx.Client) -> None:
     pr = response.json()
     try:
         valid = (pr["number"] == s.pull_request and type(pr["number"]) is int
-                 and pr["head"]["repo"]["full_name"] == pr["base"]["repo"]["full_name"] == s.repository
-                 and pr["head"]["repo"]["fork"] is False
+                 and pr["base"]["repo"]["full_name"] == s.repository
+                 and pr["head"]["repo"]["full_name"] == s.head_repository
+                 and pr["head"]["repo"]["fork"] is s.head_repository_is_fork
+                 and pr["base"]["repo"]["fork"] is s.base_repository_is_fork
                  and pr["head"]["sha"].lower() == s.commit.lower()
                  and pr["base"]["sha"].lower() == s.base_commit)
     except (KeyError, TypeError, AttributeError):
@@ -306,8 +330,14 @@ def preflight(s: Settings, *, client=None, transport=None) -> dict:
         raise Refused("The read-only base-build preflight could not be verified. No task was submitted.") from None
 
 
-def aggregate_result(result: dict) -> dict:
-    """Keep the existing SDK result shape, with only fields its aggregate renderer and gate use."""
+def aggregate_result(result: dict, *, publish_report_links: bool = True) -> dict:
+    """Project public fields without changing the validated original execution result."""
+    if type(publish_report_links) is not bool:
+        raise Refused("The report-link projection needs an explicit boolean.")
+    expected_body = report.pr_summary(result)
+    if not publish_report_links:
+        result = {key: value for key, value in result.items() if key != "link"}
+        expected_body = report.pr_summary(result)
     def numeric(value):
         if type(value) not in (int, float):
             return None
@@ -389,9 +419,35 @@ def aggregate_result(result: dict) -> dict:
         out["compare"]["base"] = experiment(cmp["base"])
         out["compare"]["candidate"] = experiment(cmp.get("candidate"))
         out["compare"]["scorers"] = [scorer(s) for s in cmp["scorers"]]
-    if report.pr_summary(out) != report.pr_summary(result):
+    if report.pr_summary(out) != expected_body:
         raise Refused("The aggregate report does not preserve the installed SDK's report contract.")
     return out
+
+
+def guard_public_strings(public_strings: list[str], s: Settings) -> None:
+    for secret in (s.api_key, s.github_token):
+        variants = (secret, report._markdown(secret), html.escape(secret), quote(secret, safe=""))
+        if any(value and value in text for value in variants for text in public_strings):
+            raise Refused("The public aggregate contains a known credential. Publication was refused.")
+    if s.publish_report_links:
+        return
+    known = set()
+    for address in (s.endpoint, s.ui_url):
+        try:
+            hostname = urlsplit(address).hostname
+        except ValueError:
+            raise Refused("The private reporting addresses could not be checked.") from None
+        for value in (address, hostname):
+            if value:
+                known.update(v.casefold() for v in (value, report._markdown(value), html.escape(value), quote(value, safe="")))
+    for text in public_strings:
+        # Decode only for known-address comparison. Never rewrite the public evidence.
+        for _ in range(3):
+            if any(value in text.casefold() for value in known):
+                raise Refused("The public aggregate contains a private reporting address. Publication was refused.")
+            text = html.unescape(unquote(text))
+            text = re.sub(r"\\u([0-9a-fA-F]{4})", lambda m: chr(int(m[1], 16)), text)
+            text = re.sub(r"\\([^\w\s])", r"\1", text)
 
 
 def public_body(result: dict, s: Settings) -> str:
@@ -406,11 +462,8 @@ def public_body(result: dict, s: Settings) -> str:
         elif isinstance(value, list):
             for item in value:
                 yield from strings(item)
-    public_strings = [body, *strings(result)]
-    for secret in (s.api_key, s.github_token):
-        variants = (secret, report._markdown(secret), html.escape(secret), quote(secret, safe=""))
-        if any(value and value in text for value in variants for text in public_strings):
-            raise Refused("The public aggregate contains a known credential. Publication was refused.")
+    guard_public_strings([body, report.comment_marker(s.check_key), "Evaluation: " + s.check_key,
+                          *strings(result)], s)
     return body
 
 
@@ -555,8 +608,7 @@ def publish_check(result: dict | None, s: Settings, *, reconcile_only=False, tra
         if len(body.encode("utf-8")) > 60000:
             raise Refused("The sanitized check summary is too large; no check was written.")
         name = "Evaluation: " + s.check_key
-        if any(secret in name for secret in (s.api_key, s.github_token)):
-            raise Refused("A credential cannot be a public check name.")
+        guard_public_strings([name, body], s)
         identity = hashlib.sha256(f"{s.repository}:{s.pull_request}:{s.commit}:{s.base_commit}:{s.baseline_experiment}:{s.check_key}".encode()).hexdigest()
         wanted = {"status": "completed", "conclusion": conclusion, "external_id": identity,
                   "output": {"title": "Evaluation " + conclusion, "summary": body}}
@@ -668,7 +720,7 @@ def run(s: Settings, output: Path, *, evaluate: Callable = execute, publish: Cal
             code, result = evaluate(s, private)  # Exactly one CLI invocation. No replacement submission.
         validate_result(result, code, s, baseline)
         confirm(s)  # Recheck head/base drift before either publication side effect.
-        aggregate = aggregate_result(result)
+        aggregate = aggregate_result(result, publish_report_links=s.publish_report_links)
         body = public_body(aggregate, s)
         (output / "aggregate-result.json").write_text(json.dumps(aggregate, indent=2) + "\n")
         (output / "evaluation.md").write_text(body)

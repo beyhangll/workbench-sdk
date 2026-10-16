@@ -128,6 +128,7 @@ class Settings:
     task: str = ""
     candidate_prompt: PromptFile | None = field(default=None, repr=False)
     base_prompt: PromptFile | None = field(default=None, repr=False)
+    development_must_pass: bool = False
 
 
 def confirm_prompt_files(s: Settings) -> None:
@@ -216,12 +217,15 @@ def settings(env: dict[str, str]) -> Settings:
         if raw_task and not UUID.fullmatch(task):
             raise Refused("The optional task gate needs an explicit task UUID from trusted configuration.")
         task = task.lower()
+        development = env.get("AQ_CI_DEVELOPMENT_MUST_PASS", "false").strip().lower()
+        if development not in ("true", "false") or development == "true" and task:
+            raise Refused("Development must-pass mode needs true or false and cannot select a signed task gate.")
         s = Settings(repository, number, commit, endpoint_name, env["AQ_CI_TARGET"], env["AQ_CI_DATASET"],
                         str(budget), api, env.get("AQ_UI_URL", "").strip() or api, env["AQ_API_KEY"],
                         env["AQ_CI_GITHUB_TOKEN"], publisher_id, key, timeout,
                         env.get("AQ_CI_RECONCILE_REPORT", "").strip(), base_sha.lower(), base_endpoint,
                         baseline.lower(), check_app_id, head_repository, head_repository_is_fork,
-                        base_repository_is_fork, publish_report_links == "true", task)
+                        base_repository_is_fork, publish_report_links == "true", task, development_must_pass=development == "true")
         candidate_file = env.get("AQ_CI_SYSTEM_PROMPT_FILE", "")
         base_file = env.get("AQ_CI_BASE_SYSTEM_PROMPT_FILE", "")
         if bool(candidate_file) != bool(base_file):
@@ -394,6 +398,10 @@ def preflight(s: Settings, *, client=None, transport=None) -> dict:
             if (base.get("progress") or {}).get("include_rejected") is not False:
                 raise Refused("The existing CLI cannot preserve an include-all or unknown legacy rejected-row policy.")
             complete_baseline(base)
+            if s.development_must_pass:
+                observed = client.development_check(base["id"])
+                if report.development_outcome(base, observed)[0] == report.UNJUDGED:
+                    raise Refused("The protected baseline has no complete frozen development must-pass evidence. No task was submitted.")
             if s.candidate_prompt:
                 if agent.get("supports_overrides") is not True or agent.get("non_production") is not True:
                     raise Refused("Prompt files require a non-production agent that explicitly supports overrides.")
@@ -479,7 +487,7 @@ def aggregate_result(result: dict, *, publish_report_links: bool = True, prompt_
     def experiment(exp):
         if exp is None:
             return None
-        out = selected(exp, ("id", "agent_id", "dataset_id", "dataset_version", "repeats", "name", "status", "stop_reason"))
+        out = selected(exp, ("id", "agent_id", "dataset_id", "dataset_version", "dataset_version_id", "repeats", "name", "status", "stop_reason"))
         out["target"] = selected(exp.get("target") or {}, ("kind", "agent_id", "commit_sha", "agent_endpoint",
                                                             "effective_agent_endpoint", "endpoint_overridden"))
         if prompt_bindings:
@@ -527,6 +535,32 @@ def aggregate_result(result: dict, *, publish_report_links: bool = True, prompt_
         out["compare"]["base"] = experiment(cmp["base"])
         out["compare"]["candidate"] = experiment(cmp.get("candidate"))
         out["compare"]["scorers"] = [scorer(s) for s in cmp["scorers"]]
+    if result.get("development_must_pass") is True:
+        out["development_must_pass"] = True
+        observed = result.get("development_check")
+        checked, reason = report.development_outcome(result.get("experiment") or {}, observed)
+        out["development_check"] = None
+        if checked != report.UNJUDGED or reason != report.DEVELOPMENT_UNKNOWN:
+            out["development_check"] = selected(observed, ("kind", "release_acceptance", "experiment_id", "dataset_id",
+                "dataset_version", "dataset_version_id", "dataset_rows", "repeats", "row_scope", "status", "cases",
+                "failures", "unresolved", "bound", "failed_rows", "unknown_rows", "reason"))
+            out["development_check"]["scorers"] = [selected(sc, ("scorer_id", "cases", "failures", "unresolved", "bound"))
+                                                    for sc in observed["scorers"]]
+        # Development publication needs ordinals and counts, not customer-authored labels or error text.
+        out["reason"] = out["link"] = None
+        for side in (out["experiment"], (out.get("compare") or {}).get("base"), (out.get("compare") or {}).get("candidate")):
+            if side is None:
+                continue
+            side["name"], side["stop_reason"] = "Development experiment", None
+            for items in (side["scorers"], side["summary"]["scorers"]):
+                for i, sc in enumerate(items, 1):
+                    sc["name"] = f"Scorer {i}"
+            side["progress"]["planning"] = {}
+        if out.get("compare") is not None:
+            out["compare"]["note"] = None
+            out["compare"]["driven_by"] = []
+            for i, sc in enumerate(out["compare"]["scorers"], 1):
+                sc["name"], sc["note"] = f"Scorer {i}", None
     if report.pr_summary(out) != expected_body:
         raise Refused("The aggregate report does not preserve the installed SDK's report contract.")
     return out
@@ -612,6 +646,9 @@ def validate_result(result: dict, code: int, s: Settings, baseline: dict | None 
     if code not in (0, 1, 2, 3):
         raise Refused("The evaluation returned an unsupported exit status.")
     exp = result.get("experiment")
+    if (result.get("development_must_pass", False) is not s.development_must_pass
+            or not s.development_must_pass and result.get("development_check") is not None):
+        raise Refused("The retained report does not match the trusted development-check setting.")
     if not isinstance(exp, dict) or (exp.get("target") or {}).get("commit_sha") != s.commit:
         raise Refused("The retained experiment does not bind the tested commit.")
     task = result.get("task")
@@ -664,6 +701,8 @@ def validate_result(result: dict, code: int, s: Settings, baseline: dict | None 
                     before, after = selected(before or {}, keys), selected(after or {}, keys)
                 if (s.reconcile_report or public_projection) and field == "scorers":
                     before, after = ([selected(sc, ("id", "name")) for sc in side] for side in (before or [], after or []))
+                    if s.development_must_pass:
+                        before = [{"id": sc["id"], "name": f"Scorer {i}"} for i, sc in enumerate(before, 1)]
                 if before != after:
                     raise Refused("The baseline configuration changed between preflight and comparison.")
             if any(exp.get(field) != baseline.get(field) for field in ("agent_id", "dataset_id", "dataset_version", "repeats")):
@@ -689,7 +728,8 @@ def validate_result(result: dict, code: int, s: Settings, baseline: dict | None 
         if any((side.get("progress") or {}).get("row_ids") is not None for side in (base, exp, candidate)):
             raise Refused("The retained comparison introduced an unsupported pinned-row selection.")
     task_below = bool(s.task) and report.task_outcome(exp, result.get("task_verdict"))[0] == report.REGRESSION
-    if code in (0, 1) and not task_below:
+    development_failed = s.development_must_pass and report.development_outcome(exp, result.get("development_check"))[0] == report.REGRESSION
+    if code in (0, 1) and not task_below and not development_failed:
         complete_baseline(exp)
         complete_baseline((cmp or {}).get("base") or {})
         complete_baseline((cmp or {}).get("candidate") or {})
@@ -699,7 +739,8 @@ def validate_result(result: dict, code: int, s: Settings, baseline: dict | None 
                 or matched != cmp["candidate"]["summary"]["rows"]):
             raise Refused("The comparison does not cover the same complete requested row set.")
     checked, _ = report.outcome(exp, result.get("compare"), None, compare_wanted=True, fail_on="regression",
-                                task_wanted=bool(s.task), task_verdict=result.get("task_verdict"))
+                                task_wanted=bool(s.task), task_verdict=result.get("task_verdict"),
+                                development_wanted=s.development_must_pass, development_check=result.get("development_check"))
     if checked != code:
         raise Refused("Missing, incomplete or conflicting evidence cannot pass the evaluation gate.")
     if result.get("verdict") != (result.get("compare") or {}).get("verdict"):
@@ -717,6 +758,8 @@ def execute(s: Settings, private: Path) -> tuple[int, dict]:
             "--timeout=" + str(s.timeout), "--report-file=/dev/null", "--json"]
     if s.task:
         args.append("--task=" + s.task)
+    if s.development_must_pass:
+        args.append("--development-must-pass")
     if s.candidate_prompt:
         confirm_prompt_files(s)
         prompt_path = private / "candidate-system-prompt.txt"

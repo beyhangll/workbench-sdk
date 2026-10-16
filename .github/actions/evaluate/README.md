@@ -307,3 +307,24 @@ payloads and is checked against the same SDK renderer and outcome gate.
 The [release and scheduled-run guide](../../../docs/sdk-release.md) separates
 prepared workflows from actual registry/customer activation. No package release
 or customer CI run is established by this source change.
+
+## Development must-pass condition
+
+The optional trusted job environment `AQ_CI_DEVELOPMENT_MUST_PASS=true` enables
+the existing CLI's `--development-must-pass` condition. Its default is `false`;
+other values are refused. It cannot select a signed task gate at the same time.
+This is product Action behavior, not an edit to any workflow or deployment.
+
+The protected baseline must have compatible frozen development membership.
+One verified failed must-pass case fails the check regardless of the statistical
+verdict. Incomplete or unscored cases remain unknown and cannot pass. Complete
+nonempty zero-failure coverage leaves the other check controls in force.
+
+Comments say **Development only. Not release acceptance.** They list failed and
+unknown cases by one-based row number in the whole frozen dataset version.
+They never include questions, answers, traces or customer-authored labels.
+Development aggregate artifacts also exclude these labels and private diagnostics.
+Masking refusal stays unknown. Reconciliation must retain the same trusted mode;
+it cannot upgrade an old artifact into a development or signed release pass.
+Existing signed-task, held-out, prompt, baseline, scorer, publisher and budget
+checks are unchanged. No workflow setting or new live run is enabled by this change.

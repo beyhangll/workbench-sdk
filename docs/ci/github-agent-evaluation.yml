@@ -78,7 +78,7 @@ jobs:
     steps:
       # No customer checkout, downloaded PR code, or build artifact enters this runner.
       - id: evaluation
-        uses: beyhangll/workbench-sdk/.github/actions/evaluate@7e35c68ab6d13c225da4e35f289c754439c60ff7
+        uses: beyhangll/workbench-sdk/.github/actions/evaluate@REVIEWED_ACTION_COMMIT
         continue-on-error: true
         with:
           endpoint: ${{ vars.AQ_ENDPOINT }}
@@ -88,8 +88,13 @@ jobs:
           dataset: ${{ vars.AQ_DATASET }}
           agent-endpoint: ${{ needs.deploy-test-endpoint.outputs.endpoint }}
           commit: ${{ needs.deploy-test-endpoint.outputs.commit }}
+          # Protected trusted base-build values, never a PR artifact or mutable current selector.
+          base-commit: ${{ vars.AQ_BASE_DEPLOYED_COMMIT }}
+          base-endpoint: ${{ vars.AQ_BASE_AGENT_ENDPOINT }}
+          baseline-experiment: ${{ vars.AQ_BASELINE_EXPERIMENT }}
+          check-app-id: ${{ vars.AQ_CHECK_APP_ID }}
           budget: ${{ vars.AQ_BUDGET_USD }}
-          github-token: ${{ secrets.AQ_COMMENT_TOKEN }}
+          github-token: ${{ secrets.AQ_CHECK_COMMENT_TOKEN }}
           publisher-id: ${{ vars.AQ_COMMENT_PUBLISHER_ID }}
           check-key: ${{ vars.AQ_CHECK_KEY }}
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

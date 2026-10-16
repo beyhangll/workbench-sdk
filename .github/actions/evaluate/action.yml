@@ -22,14 +22,26 @@ inputs:
   commit:
     description: Full tested PR head SHA. This declaration is not deployment attestation.
     required: true
+  baseline-experiment:
+    description: Immutable baseline experiment UUID supplied by the protected customer base-build handoff. Never current or a name.
+    required: true
+  base-commit:
+    description: Full PR-base commit exported after the customer's base-build deployment checks. This is declared provenance, not service attestation.
+    required: true
+  base-endpoint:
+    description: Protected base-build AgentCore endpoint matching the baseline's persisted effective endpoint.
+    required: true
   budget:
     description: Required metered USD budget, subject to existing server limits.
     required: true
   github-token:
-    description: Separate repository comment token from protected trusted context.
+    description: Separate repository token with comment and check-run permissions from protected trusted context.
     required: true
   publisher-id:
     description: Trusted configured account or bot identity for that token, never the workflow actor or an artifact field.
+    required: true
+  check-app-id:
+    description: Trusted GitHub App ID owning the check runs, distinct from the comment publisher user ID.
     required: true
   check-key:
     description: Stable agent.dataset comment key and caller concurrency key.
@@ -41,7 +53,7 @@ inputs:
     description: Existing CLI scoring wait deadline in seconds, from 1 through 3600.
     default: '1800'
   reconcile-report:
-    description: Retained aggregate-result.json for read-only reconciliation. Skips evaluation and cannot write comments.
+    description: Retained aggregate-result.json for read-only reconciliation. Skips evaluation and cannot write comments or checks.
     default: ''
 outputs:
   evaluation-exit-code:
@@ -50,6 +62,9 @@ outputs:
   publication-status:
     description: Confirmed or unconfirmed comment publication status.
     value: ${{ steps.evaluate.outputs.publication-status }}
+  check-publication-status:
+    description: Confirmed or unconfirmed publication of the owned terminal check.
+    value: ${{ steps.evaluate.outputs.check-publication-status }}
   report-dir:
     description: Aggregate-only reports. Never upload the sibling private directory.
     value: ${{ steps.evaluate.outputs.report-dir }}
@@ -78,9 +93,13 @@ runs:
         AQ_CI_TASK: ${{ inputs.task }}
         AQ_CI_AGENT_ENDPOINT: ${{ inputs.agent-endpoint }}
         AQ_CI_COMMIT: ${{ inputs.commit }}
+        AQ_CI_BASELINE_EXPERIMENT: ${{ inputs.baseline-experiment }}
+        AQ_CI_BASE_COMMIT: ${{ inputs.base-commit }}
+        AQ_CI_BASE_ENDPOINT: ${{ inputs.base-endpoint }}
         AQ_CI_BUDGET: ${{ inputs.budget }}
         AQ_CI_GITHUB_TOKEN: ${{ inputs.github-token }}
         AQ_CI_PUBLISHER_ID: ${{ inputs.publisher-id }}
+        AQ_CI_CHECK_APP_ID: ${{ inputs.check-app-id }}
         AQ_CI_CHECK_KEY: ${{ inputs.check-key }}
         AQ_CI_TIMEOUT: ${{ inputs.timeout }}
         AQ_CI_RECONCILE_REPORT: ${{ inputs.reconcile-report }}

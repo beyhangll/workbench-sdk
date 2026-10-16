@@ -146,6 +146,59 @@ change or bypass that policy. The branch-build step uses the existing
 and [BatchGetBuilds](https://docs.aws.amazon.com/cli/latest/reference/codebuild/batch-get-builds.html)
 interfaces. No customer runtime or infrastructure is created here.
 
+## Optional paired system-prompt files
+
+`system-prompt-file` and `base-system-prompt-file` are optional local data-file
+paths. Supply both or neither. Without them, the existing endpoint-only path is
+unchanged. Prompt files require the connected agent to explicitly support
+overrides and be non-production. Both endpoint inputs may be `DEFAULT`; a prompt
+comparison does not require another AgentCore endpoint or a deployment.
+
+The trusted caller must obtain the candidate and protected-base bytes from their
+exact head and base commits, for example through authenticated GitHub tree/blob
+reads. Verify repository, path, blob identity and content before writing these
+files. Do not check out PR code or execute downloaded files. A local file path or
+its SHA256 alone is not Git source attestation. For owner-created sample PRs,
+independently verify the entire PR workflow definition before opening them:
+plain `pull_request` events can evaluate that definition even without checkout.
+
+The Action freezes both files privately before preflight and refuses missing,
+changed, empty, non-UTF-8, symlinked or non-regular inputs. The maximum is 256 KiB
+per file. LF bytes, including a final newline, are preserved exactly. CR and CRLF
+are explicitly refused because the unchanged CLI file reader would normalize
+them. No truncation or silent normalization occurs. Known evaluation or publisher
+credentials in either prompt refuse the run before planning or publication.
+
+The immutable baseline's saved `target.overrides.system_prompt` must match the
+protected-base bytes exactly. Active model or other overrides and unknown override
+keys are refused; known unused override keys may remain `null`. The existing
+scorer-only readback remains required. A separate planning-only estimate must
+confirm the candidate prompt, connected agent, endpoint and tested commit before
+the CLI can submit. No target or judge runs during either preflight. Planning
+confirmation describes requested configuration, not observed serving attestation.
+
+The Action passes a private exclusive file snapshot to the existing
+`--system-prompt-file` interface and uses `--concurrency=1` in this new mode.
+The no-file path retains its original concurrency behavior. Original files and
+the private snapshot are rechecked before the single CLI invocation. The existing
+runtime override contract rejects missing or mismatched prompt confirmations;
+task failures and incomplete scoring cannot become a passing result. Usage and
+billing limitations remain separate and are not resolved by prompt binding.
+
+Only SHA256 bindings derived from validated saved target override text enter the
+aggregate target and publication metadata. Raw prompts remain excluded. Both the
+second publication validation and read-only reconciliation check those bindings
+against the frozen files and protected run/commit ownership. Historical no-file
+reports remain readable; they are never upgraded with today's prompt files.
+Keep the same paired files and source binding when reconciling a prompt-file run.
+
+Known complete prompt echoes, including common encoded forms, refuse public
+free-text reports, comments and checks; private CLI debug copies remove those
+known values too. This is not arbitrary fragment, personal-data or secret
+detection. The existing generic failure check remains the only safe refusal
+fallback. Discard restricted prompt snapshots with the fresh runner under the
+caller's retention policy; upload only the existing aggregate allowlist.
+
 ## Outcomes, privacy and reconciliation
 
 The Action captures full CLI JSON and stderr privately in memory. Debug copies

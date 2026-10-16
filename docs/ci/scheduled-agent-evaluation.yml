@@ -1,0 +1,123 @@
+# Customer example only. Copy into trusted default-branch configuration after
+# the owner chooses an approved runner, isolated target, data, budget and access.
+name: Scheduled agent evaluation
+on:
+  schedule:
+    - cron: '17 5 * * 1'
+  workflow_dispatch:
+permissions: {}
+concurrency:
+  group: scheduled-agent-evaluation-${{ github.repository_id }}-${{ vars.AQ_CHECK_KEY }}
+  cancel-in-progress: false
+jobs:
+  evaluate:
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    # No default public runner is selected for customer evaluation data.
+    runs-on: ${{ fromJSON(vars.EVALUATION_RUNNER_LABELS) }}
+    environment: agent-scheduled-evaluation
+    steps:
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - id: install
+        shell: bash
+        env:
+          SDK_REVISION: ${{ vars.SDK_REVISION }}
+        run: |
+          python -I - <<'PY'
+          import os, re, subprocess, sys, tempfile
+          from pathlib import Path
+          sha = os.environ.get('SDK_REVISION', '')
+          if not re.fullmatch(r'[0-9a-fA-F]{40}|[0-9a-fA-F]{64}', sha):
+              raise SystemExit('Configure a reviewed full SDK commit before enabling this job.')
+          root = Path(tempfile.mkdtemp(prefix='scheduled-sdk-', dir=os.environ['RUNNER_TEMP']))
+          subprocess.run([sys.executable, '-I', '-m', 'venv', str(root)], check=True)
+          python = root / 'bin/python'
+          subprocess.run([str(python), '-I', '-m', 'pip', '--isolated', 'install', '--quiet',
+                          'git+https://github.com/beyhangll/workbench-sdk.git@' + sha + '#subdirectory=packages/aq-sdk'],
+                         check=True, capture_output=True)
+          with Path(os.environ['GITHUB_OUTPUT']).open('a') as out:
+              out.write('python=' + str(python) + '\n')
+          PY
+      - id: evaluate
+        shell: bash
+        env:
+          SDK_PYTHON: ${{ steps.install.outputs.python }}
+          AQ_ENDPOINT: ${{ secrets.EVALUATION_ENDPOINT }}
+          AQ_UI_URL: ${{ secrets.EVALUATION_UI_URL }}
+          AQ_API_KEY: ${{ secrets.AQ_API_KEY }}
+          AQ_AGENT: ${{ vars.AQ_AGENT }}
+          AQ_DATASET: ${{ vars.AQ_DATASET }}
+          AQ_TASK: ${{ vars.AQ_TASK }}
+          AQ_BUDGET_USD: ${{ vars.AQ_BUDGET_USD }}
+          AQ_TIMEOUT: '1800'
+        run: |
+          "$SDK_PYTHON" -I - <<'PY'
+          import html, json, os, re, subprocess, sys, tempfile
+          from decimal import Decimal
+          from pathlib import Path
+          from urllib.parse import quote
+          from uuid import UUID
+          from aq_sdk import report
+          e = os.environ
+          task = e.get('AQ_TASK', '')
+          try:
+              if e.get('GITHUB_EVENT_NAME') not in ('schedule', 'workflow_dispatch'):
+                  raise ValueError
+              if task: task = str(UUID(task.strip()))
+              budget = Decimal(e['AQ_BUDGET_USD'])
+              timeout = int(e['AQ_TIMEOUT'])
+              if (not budget.is_finite() or budget <= 0 or not 1 <= timeout <= 3600
+                  or not all(e.get(k, '').strip() for k in ('AQ_AGENT', 'AQ_DATASET', 'AQ_ENDPOINT', 'AQ_API_KEY'))):
+                  raise ValueError
+          except Exception:
+              raise SystemExit('Trusted scheduled context, target, dataset, task or budget is invalid.') from None
+          root = Path(tempfile.mkdtemp(prefix='scheduled-evaluation-', dir=e['RUNNER_TEMP']))
+          private = root / 'private'
+          private.mkdir(mode=0o700)
+          args = [sys.executable, '-I', '-m', 'aq_sdk.cli', 'eval', 'run', '--target=' + e['AQ_AGENT'],
+                  '--dataset=' + e['AQ_DATASET'], '--compare-to=current', '--fail-on=regression',
+                  '--row-scope=' + ('held_out' if task else 'development'), '--budget=' + str(budget),
+                  '--timeout=' + str(timeout), '--report-file=/dev/null', '--json']
+          if task: args.append('--task=' + task)
+          child_env = {k: e[k] for k in ('PATH', 'LANG', 'LC_ALL', 'AQ_ENDPOINT', 'AQ_API_KEY', 'AQ_UI_URL') if k in e}
+          completed = subprocess.run(args, cwd=private, env=child_env, capture_output=True, text=True, check=False)
+          token = e['AQ_API_KEY']
+          variants = {token, report._markdown(token), report._markdown(report._markdown(token)), html.escape(token), quote(token, safe='')}
+          variants.update(json.dumps(v)[1:-1] for v in tuple(variants))
+          def scrub(text):
+              for value in sorted(variants, key=len, reverse=True):
+                  if value: text = text.replace(value, '[credential removed]')
+              return text
+          (private / 'result.redacted.private.json').write_text(scrub(completed.stdout))
+          (private / 'stderr.redacted.private.txt').write_text(scrub(completed.stderr))
+          code = completed.returncode
+          integration_code = 3
+          try:
+              result = json.loads(completed.stdout)
+              expected, _ = report.outcome(result['experiment'], result.get('compare'), None, compare_wanted=True,
+                                           fail_on='regression', task_wanted=bool(task), task_verdict=result.get('task_verdict'))
+              if (type(result.get('exit_code')) is not int or result['exit_code'] != code or expected != code
+                  or task and (result.get('task') or {}).get('id') != task):
+                  raise ValueError
+              body = report.pr_summary(result)
+              if any(v and v in body for v in variants): raise ValueError
+              (root / 'evaluation.md').write_text(body)
+              integration_code = code
+          except Exception:
+              print('Scheduled evaluation is unconfirmed. Inspect private records before any retry.')
+          (root / 'outcome.json').write_text(json.dumps({'evaluation_exit_code': code if code in (0,1,2,3) else None,
+                                                        'integration_exit_code': integration_code}))
+          with Path(e['GITHUB_OUTPUT']).open('a') as out:
+              out.write('report-dir=' + str(root) + '\n')
+          raise SystemExit(integration_code)
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always() && steps.evaluate.outputs.report-dir != ''
+        with:
+          name: scheduled-evaluation-aggregate
+          path: |
+            ${{ steps.evaluate.outputs.report-dir }}/evaluation.md
+            ${{ steps.evaluate.outputs.report-dir }}/outcome.json
+          retention-days: 7
+          if-no-files-found: error

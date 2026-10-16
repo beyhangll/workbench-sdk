@@ -2,6 +2,8 @@
 
     aq eval run --dataset questions --target my-agent --compare-to current --fail-on regression
 
+``aq evidence verify`` checks a signed evidence pack offline (``evidence.py``).
+
 The target is a connected agent. AQ runs it in your AWS account, with the
 prompt or model you override, and scores it with the scorers saved in AQ. See
 ``report.py`` for the exit codes.
@@ -17,7 +19,7 @@ import threading
 from pathlib import Path
 from typing import Any, TextIO
 
-from . import __version__, report
+from . import __version__, evidence, report
 from .client import Client
 from .config import build
 from .errors import AQError
@@ -62,6 +64,7 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--endpoint", help="AQ address. Default: AQ_ENDPOINT.")
     run.add_argument("--ui-url", help="Where people open the app, for the printed link. Default: AQ_UI_URL, then the address.")
     run.add_argument("--json", action="store_true", help="Print one JSON result instead of text.")
+    evidence.add_parser(sub)
     return p
 
 
@@ -226,6 +229,8 @@ def main(argv: list[str] | None = None, *, out: TextIO | None = None, err: TextI
          client: Client | None = None) -> int:
     out, err = out or sys.stdout, err or sys.stderr
     args = parser().parse_args(argv)
+    if args.group == "evidence":
+        return evidence.run(args, out, err)
     state: dict[str, bool] = {}
     # A below-bar task or regression exits 1. Problems before/after starting exit 2/3.
     try:

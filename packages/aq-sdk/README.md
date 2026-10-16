@@ -295,6 +295,29 @@ and pagination with mocked GitHub HTTP. They do not establish real repository
 publication or live agent execution. HTTP PR checks are deferred, with both
 existing spending controls unchanged.
 
+## Verify an evidence pack offline
+
+```bash
+pip install './packages/aq-sdk[evidence]'
+aq evidence verify evidence-pack.json --public-key expected-signer.pem --tsa-cert trusted-tsa.pem
+```
+
+Obtain the expected signer's public key independently through a trusted channel;
+the key embedded in the pack does not establish trust. Alternatively, use
+`--key-fingerprint` with its SHA-256 fingerprint over DER SubjectPublicKeyInfo.
+A missing or mismatched expected signer refuses verification.
+
+This command needs no API key or endpoint and makes no service or model calls.
+Exit codes are 0 when every check passes, 1 when verification fails, and 2 for
+invalid command inputs or files. `--json` retains the individual check results.
+
+The RFC 3161 timestamp is required by default. Supplying `--tsa-cert` also checks
+the timestamp authority against those trusted certificates. Without it, a valid
+timestamp may pass with `tsa_trusted: false`; text output warns that the authority
+was not checked. `--allow-no-timestamp` permits an absent or null timestamp;
+it does not permit malformed timestamp data. Verification does not approve a
+release or establish that a measured agent is qualified.
+
 ## Tests
 
 ```bash

@@ -1,0 +1,29 @@
+{
+  "format": "aq.signed-evidence/1",
+  "pack": {
+    "agent": {
+      "name": "Weather agent"
+    },
+    "decision": {
+      "outcome": "release"
+    },
+    "id": "fixture-1",
+    "note": "A fixed pack for the SDK tests.",
+    "schema": "aq.evidence-pack/1"
+  },
+  "pack_sha256": "3d51cf8a49d923e03c3fab7f5a5523d78ff5dd511046c4306c28c4ac6d43f269",
+  "signature": {
+    "algorithm": "ECDSA_SHA_256",
+    "public_key": "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEHlHoM1CHtBDE5Do3e0F/D6s9OPKA\nBKw6WTuGqESN83CyZjm8U2FY6i78UrtvDhLbgq4m5IG/1tTfRHZlymEQ/g==\n-----END PUBLIC KEY-----\n",
+    "public_key_sha256": "c8a8bb375f1577d9d63f0b29261c7e885c55ca6aa922633089f6659211770cf3",
+    "value": "MEUCIEde8RpPR58Tp3axxo9vwoveG0zpxOgbGBPmERA9OXoBAiEAiZo/iFTDa1lMaWSEC7unfPMrQbrfWiohnlr+T365WHo=",
+    "signed_at": "2026-10-13T09:30:13+00:00"
+  },
+  "timestamp": {
+    "token": "MIIDRAYJKoZIhvcNAQcCoIIDNTCCAzECAQMxDzANBglghkgBZQMEAgEFADBzBgsqhkiG9w0BCRABBKBkBGIwYAIBAQYJKwYBBAGGjR8BMDEwDQYJYIZIAWUDBAIBBQAEIFsWC8qxYoYo1jBltAlcInTL0YMPuvnOrhwhBHhX2Z0fAgID6RgPMjAyNjEwMTMwOTMwMTVaAggj9nSCfhaAgaCCAXkwggF1MIIBGqADAgECAhRX3IysyRM0W8QeQooSZxNQ51h1eDAKBggqhkjOPQQDAjAYMRYwFAYDVQQDDA1UZXN0IFRTQSBSb290MB4XDTI2MDEwMTAwMDAwMFoXDTM2MDEwMTAwMDAwMFowEzERMA8GA1UEAwwIVGVzdCBUU0EwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAATJmwv5ivPas1R7as3sMXDzHRSRoucwE4YqL+/ZIvHKfj9IyLB5+A3zcnsHNuoHmZSwlT9Hhjbckk9c9EFtkwZto0cwRTAMBgNVHRMBAf8EAjAAMB0GA1UdDgQWBBTP4YooaBIfKK+nMdld0ozXouFElTAWBgNVHSUBAf8EDDAKBggrBgEFBQcDCDAKBggqhkjOPQQDAgNJADBGAiEAk1Igagm5KsLRTnwwfEO/R5z/SWBnK0SwxElKF4B1XNICIQCWPOGvVVuQ7wFprbwpwB6e22y+ov1cBPzpMtpH7YrCPDGCAScwggEjAgEBMDAwGDEWMBQGA1UEAwwNVGVzdCBUU0EgUm9vdAIUV9yMrMkTNFvEHkKKEmcTUOdYdXgwDQYJYIZIAWUDBAIBBQCggYYwGgYJKoZIhvcNAQkDMQ0GCyqGSIb3DQEJEAEEMC8GCSqGSIb3DQEJBDEiBCArzyzQZmbevoznlYKBSEej7rOcDO9Moa6/PJ05jjLSBTA3BgsqhkiG9w0BCRACLzEoMCYwJDAiBCCwd4zmgOJ8GEkJQrDwopsOuzYWKmuEP7ZAJ7cFgkBxPTAKBggqhkjOPQQDAgRIMEYCIQDRUFPUcgOTrHTqARlUzD42mDW5IpZWn1O7EVZFYaGhsAIhAKLXOS7zxk+3iTWcmupGIdFFuzwZlLRSnpK22RTyulHX",
+    "gen_time": "2026-10-13T09:30:15+00:00",
+    "serial": "1001",
+    "policy": "1.3.6.1.4.1.99999.1",
+    "imprint_sha256": "5b160bcab1628628d63065b4095c2274cbd1830fbaf9ceae1c21047857d99d1f"
+  }
+}

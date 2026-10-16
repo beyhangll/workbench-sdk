@@ -1875,7 +1875,7 @@ def test_requested_prompt_or_unrequested_override_cannot_be_substituted(tmp_path
         target["overrides"]["skills"] = []
     else:
         target.pop("overrides")
-        target["system_prompt_sha256"] = s.candidate_prompt.sha256
+        target["prompt_sha256"] = s.candidate_prompt.sha256
     with pytest.raises(action.Refused):
         action.validate_result(result, 0, s)
 
@@ -1886,12 +1886,12 @@ def test_only_derived_prompt_digests_survive_aggregate_and_reconciliation(tmp_pa
     action.validate_result(original, 0, s)
     aggregate = action.aggregate_result(original, prompt_bindings=True)
     action.validate_result(aggregate, 0, s, public_projection=True)
-    assert aggregate["experiment"]["target"]["system_prompt_sha256"] == s.candidate_prompt.sha256
-    assert aggregate["compare"]["base"]["target"]["system_prompt_sha256"] == s.base_prompt.sha256
+    assert aggregate["experiment"]["target"]["prompt_sha256"] == s.candidate_prompt.sha256
+    assert aggregate["compare"]["base"]["target"]["prompt_sha256"] == s.base_prompt.sha256
     assert s.candidate_prompt.text not in json.dumps(aggregate) and "overrides" not in aggregate["experiment"]["target"]
     assert original["experiment"]["target"]["overrides"]["system_prompt"] == s.candidate_prompt.text
     assert report.pr_summary(aggregate) == report.pr_summary(original)
-    aggregate["experiment"]["target"]["system_prompt_sha256"] = "0" * 64
+    aggregate["experiment"]["target"]["prompt_sha256"] = "0" * 64
     with pytest.raises(action.Refused):
         action.validate_result(aggregate, 0, s, public_projection=True)
 
@@ -1984,7 +1984,7 @@ def test_actual_cli_prompt_file_preflight_publication_and_reconcile(tmp_path, mo
         metadata = json.loads((dest / "publication.json").read_text())
         assert metadata["system_prompt_bindings"]["candidate_sha256"] == s.candidate_prompt.sha256
         assert metadata["system_prompt_bindings"]["base_sha256"] == s.base_prompt.sha256
-        assert aggregate["experiment"]["target"]["system_prompt_sha256"] == s.candidate_prompt.sha256
+        assert aggregate["experiment"]["target"]["prompt_sha256"] == s.candidate_prompt.sha256
         assert len(comments.writes) == 1 and github.rows[0]["conclusion"] == ("neutral" if code == 0 else "failure")
         for file in dest.iterdir():
             assert s.candidate_prompt.text not in file.read_text() and s.base_prompt.text not in file.read_text()
@@ -2047,7 +2047,7 @@ def test_prompt_drift_after_planning_and_in_retained_binding_is_not_replaced(tmp
     else:
         result = prompt_payload(s)
         aggregate = action.aggregate_result(result, prompt_bindings=True)
-        aggregate["compare"]["base"]["target"]["system_prompt_sha256"] = "0" * 64
+        aggregate["compare"]["base"]["target"]["prompt_sha256"] = "0" * 64
         retained = tmp_path / "substituted.json"
         retained.write_text(json.dumps(aggregate))
         s.reconcile_report = str(retained)
@@ -2085,7 +2085,7 @@ def test_no_prompt_selection_keeps_legacy_aggregate_without_digest(tmp_path):
     s, result = configured(tmp_path), payload()
     action.validate_result(result, 0, s)
     aggregate = action.aggregate_result(result)
-    assert "system_prompt_sha256" not in aggregate["experiment"]["target"]
+    assert "prompt_sha256" not in aggregate["experiment"]["target"]
     action.validate_result(aggregate, 0, s, public_projection=True)
 
 
@@ -2126,3 +2126,37 @@ def test_encoded_known_credential_prompt_refuses_before_hash_or_network(tmp_path
     monkeypatch.setattr(action.PromptFile, "sha256", property(lambda _: pytest.fail("No credential hash")))
     with pytest.raises(action.Refused):
         action.settings(env)
+
+
+@pytest.mark.parametrize("side", ["base", "experiment", "comparison_candidate", "planning"])
+@pytest.mark.parametrize("conflict", [None, "0" * 64])
+def test_native_producer_prompt_hash_conflict_refuses(tmp_path, side, conflict):
+    s, _ = prompt_configured(tmp_path)
+    result = json.loads(json.dumps(prompt_payload(s)))
+    if side == "planning":
+        fake, client = prompt_client(s)
+        fake.estimate_change = lambda target: target.update(prompt_sha256=conflict)
+        try:
+            with pytest.raises(action.Refused):
+                action.preflight(s, client=client, transport=httpx.MockTransport(CheckAPI()))
+        finally:
+            client.close()
+        assert not any(method == "POST" and path == "/v1/experiments" for method, path, _ in fake.calls)
+    else:
+        target = (result["compare"]["base"] if side == "base" else result["experiment"] if side == "experiment"
+                  else result["compare"]["candidate"])["target"]
+        target["prompt_sha256"] = conflict
+        with pytest.raises(action.Refused):
+            action.validate_result(result, 0, s)
+
+
+def test_native_prompt_digest_is_reused_without_parallel_target_field(tmp_path):
+    s, _ = prompt_configured(tmp_path)
+    result = prompt_payload(s)
+    for side in (result["experiment"], result["compare"]["base"], result["compare"]["candidate"]):
+        side["target"]["prompt_sha256"] = hashlib.sha256(side["target"]["overrides"]["system_prompt"].encode()).hexdigest()
+    action.validate_result(result, 0, s)
+    aggregate = action.aggregate_result(result, prompt_bindings=True)
+    assert aggregate["experiment"]["target"].get("prompt_sha256") == s.candidate_prompt.sha256
+    assert "system_prompt_sha256" not in aggregate["experiment"]["target"]
+    action.validate_result(aggregate, 0, s, public_projection=True)

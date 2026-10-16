@@ -78,7 +78,7 @@ def prompt_digest(target: dict, *, public_projection: bool = False) -> str:
     if not isinstance(target, dict):
         raise Refused("The retained prompt target is missing or invalid.")
     if public_projection:
-        digest = target.get("system_prompt_sha256")
+        digest = target.get("prompt_sha256")
         if "overrides" in target or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
             raise Refused("The retained public prompt binding is missing or invalid.")
         return digest
@@ -88,7 +88,7 @@ def prompt_digest(target: dict, *, public_projection: bool = False) -> str:
                    or (key != "system_prompt" and value is not None) for key, value in overrides.items())):
         raise Refused("The requested prompt or an undeclared override could not be verified.")
     digest = hashlib.sha256(overrides["system_prompt"].encode("utf-8")).hexdigest()
-    if "system_prompt_sha256" in target and target["system_prompt_sha256"] != digest:
+    if "prompt_sha256" in target and target["prompt_sha256"] != digest:
         raise Refused("The retained prompt digest conflicts with its actual override.")
     return digest
 
@@ -484,7 +484,7 @@ def aggregate_result(result: dict, *, publish_report_links: bool = True, prompt_
                                                             "effective_agent_endpoint", "endpoint_overridden"))
         if prompt_bindings:
             target = exp.get("target") or {}
-            out["target"]["system_prompt_sha256"] = prompt_digest(target, public_projection="overrides" not in target)
+            out["target"]["prompt_sha256"] = prompt_digest(target, public_projection="overrides" not in target)
         out["scorers"] = [selected(s, ("id", "name")) for s in exp.get("scorers", [])]
         summary = exp.get("summary") or {}
         out["summary"] = selected(summary, ("rows", "attempts", "ok", "target_errors", "timeouts", "not_run", "rows_not_run", "rows_with_errors"))
@@ -876,8 +876,8 @@ def run(s: Settings, output: Path, *, evaluate: Callable = execute, publish: Cal
             base_target = ((aggregate.get("compare") or {}).get("base") or {}).get("target") or {}
             prompt_bindings = {"base_commit": base_target.get("commit_sha"),
                                "candidate_commit": aggregate["experiment"]["target"]["commit_sha"],
-                               "base_sha256": base_target.get("system_prompt_sha256"),
-                               "candidate_sha256": aggregate["experiment"]["target"]["system_prompt_sha256"]}
+                               "base_sha256": base_target.get("prompt_sha256"),
+                               "candidate_sha256": aggregate["experiment"]["target"]["prompt_sha256"]}
         body = public_body(aggregate, s)
         (output / "aggregate-result.json").write_text(json.dumps(aggregate, indent=2) + "\n")
         (output / "evaluation.md").write_text(body)

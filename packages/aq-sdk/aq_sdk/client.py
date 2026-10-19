@@ -130,6 +130,21 @@ class Client:
     def compare(self, base: str, candidate: str) -> dict[str, Any]:
         return self.get("/v1/compare", base=base, candidate=candidate)
 
+    def task(self, name_or_id: str, *, agent_id: str, dataset_id: str) -> dict[str, Any]:
+        """Resolve a task name or ID within the selected agent and dataset."""
+        task = _pick(self.get("/v1/agent-tasks", agent_id=agent_id), name_or_id, "task",
+                     "Open the agent's Overview in AQ to see its tasks.")
+        if task.get("agent_id") != agent_id or task.get("dataset_id") != dataset_id:
+            raise AQError("The task does not evaluate the selected agent and dataset.",
+                          "Choose the task's agent and dataset. No run was started.")
+        if not task.get("bar"):
+            raise AQError("This task has no signed bar.", "Have the owner sign a bar before running the task gate.")
+        return task
+
+    def task_verdict(self, experiment_id: str, task_id: str) -> dict[str, Any]:
+        """Read the server's verdict against the named task's current signed bar."""
+        return self.get(f"/v1/experiments/{experiment_id}/verdict", task_id=task_id)
+
     def start(self, body: dict[str, Any]) -> dict[str, Any]:
         return self.post("/v1/experiments", body)
 

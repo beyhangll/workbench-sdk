@@ -227,3 +227,14 @@ def test_started_metadata_mismatch_cancels_without_redispatch_or_success(client,
     assert code == 3 and "Calls may already have occurred" in err
     assert sum(method == "POST" and path == "/v1/experiments" for method, path, body in aq.calls) == 1
     assert sum(method == "POST" and path.endswith("/cancel") for method, path, body in aq.calls) == 1
+
+
+@pytest.mark.parametrize("field", ["base_mean", "candidate_mean", "difference"])
+def test_unscored_pairs_cannot_pass_a_comparison_gate(client, aq, field, tmp_path):
+    aq.compare["scorers"][0][field] = None
+    path = tmp_path / "unscored.md"
+    code, output, _ = run(client, "--compare-to", "current", "--fail-on", "regression", "--json",
+                          "--report-file", str(path))
+    assert code == 3 and "No scored pairs" in json.loads(output)["reason"]
+    assert "Result: not judged." in path.read_text()
+    assert [p for m, p, _ in aq.calls if m == "POST"] == ["/v1/experiments"]

@@ -13,6 +13,9 @@ inputs:
   dataset:
     description: Existing development dataset name or ID.
     required: true
+  task:
+    description: Optional existing task UUID. Uses held-out rows and the server task verdict as an additional gate.
+    default: ''
   agent-endpoint:
     description: Endpoint on the connected runtime deployed by the customer pipeline.
     required: true
@@ -72,6 +75,7 @@ runs:
         AQ_UI_URL: ${{ inputs.ui-url }}
         AQ_CI_TARGET: ${{ inputs.target }}
         AQ_CI_DATASET: ${{ inputs.dataset }}
+        AQ_CI_TASK: ${{ inputs.task }}
         AQ_CI_AGENT_ENDPOINT: ${{ inputs.agent-endpoint }}
         AQ_CI_COMMIT: ${{ inputs.commit }}
         AQ_CI_BUDGET: ${{ inputs.budget }}

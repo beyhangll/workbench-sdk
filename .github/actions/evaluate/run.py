@@ -13,6 +13,7 @@ import sys
 import tempfile
 from typing import Callable
 from urllib.parse import quote, urlsplit
+from uuid import UUID
 
 from aq_sdk import publish_pr_comment, report
 
@@ -44,6 +45,7 @@ class Settings:
     check_key: str
     timeout: int
     reconcile_report: str
+    task: str = ""
 
 
 def settings(env: dict[str, str]) -> Settings:
@@ -87,10 +89,16 @@ def settings(env: dict[str, str]) -> Settings:
             raise Refused("Separate evaluation and repository credentials are required.")
         if not env.get("AQ_CI_TARGET", "").strip() or not env.get("AQ_CI_DATASET", "").strip():
             raise Refused("A connected agent and dataset are required.")
+        task = env.get("AQ_CI_TASK", "")
+        if task:
+            try:
+                task = str(UUID(task.strip()))
+            except ValueError:
+                raise Refused("The optional task must be an existing task UUID.") from None
         return Settings(repository, number, commit, endpoint_name, env["AQ_CI_TARGET"], env["AQ_CI_DATASET"],
                         str(budget), api, env.get("AQ_UI_URL", "").strip() or api, env["AQ_API_KEY"],
                         env["AQ_CI_GITHUB_TOKEN"], publisher_id, key, timeout,
-                        env.get("AQ_CI_RECONCILE_REPORT", "").strip())
+                        env.get("AQ_CI_RECONCILE_REPORT", "").strip(), task)
     except Refused:
         raise
     except (KeyError, TypeError, ValueError, OSError, InvalidOperation):
@@ -106,7 +114,7 @@ def aggregate_result(result: dict) -> dict:
     def experiment(exp):
         if exp is None:
             return None
-        out = selected(exp, ("id", "agent_id", "name", "status", "stop_reason"))
+        out = selected(exp, ("id", "agent_id", "dataset_id", "name", "status", "stop_reason"))
         out["target"] = selected(exp.get("target") or {}, ("commit_sha",))
         out["scorers"] = [selected(s, ("id", "name")) for s in exp.get("scorers", [])]
         summary = exp.get("summary") or {}
@@ -126,6 +134,29 @@ def aggregate_result(result: dict) -> dict:
         out["compare"]["base"] = experiment(cmp["base"])
         out["compare"]["scorers"] = [selected(s, ("scorer_id", "name", "status", "note", "base_mean", "candidate_mean",
             "difference", "improved", "regressed", "unchanged", "excluded", "verdict")) for s in cmp["scorers"]]
+    if result.get("task") is not None:
+        out["task"] = selected(result["task"], ("id", "name", "agent_id", "dataset_id"))
+        v = result.get("task_verdict")
+        out["task_verdict"] = None
+        if v is not None:
+            threshold_keys = ("metric", "value", "scorer_id", "scorer", "category", "status", "observed", "bound", "cases",
+                              "failures", "unresolved", "uncategorized_cases", "undeclared_category_cases",
+                              "must_pass_status", "paired_quality_status", "reason")
+            def measurement(value):
+                kept = selected(value, ("status", "acceptance_reason", "requirements"))
+                if "thresholds" in value:
+                    kept["thresholds"] = None if value["thresholds"] is None else [selected(t, threshold_keys) for t in value["thresholds"]]
+                if kept.get("requirements") is not None:
+                    kept["requirements"] = [selected(r, ("code", "status")) for r in kept["requirements"]]
+                return kept
+            verdict = measurement(v)
+            verdict.update(selected(v, ("experiment_id", "bar_version", "slice_metadata_status")))
+            if "worst_slice" in v:
+                verdict["worst_slice"] = None if v["worst_slice"] is None else selected(v["worst_slice"], ("dimension", "value", "status"))
+            if "slices" in v:
+                verdict["slices"] = None if v["slices"] is None else [
+                    {**measurement(item), **selected(item, ("dimension", "value", "cases", "reason"))} for item in v["slices"]]
+            out["task_verdict"] = verdict
     if report.pr_summary(out) != report.pr_summary(result):
         raise Refused("The aggregate report does not preserve the installed SDK's report contract.")
     return out
@@ -173,7 +204,16 @@ def validate_result(result: dict, code: int, s: Settings) -> None:
         target = exp.get("target") or {}
         if target.get("agent_endpoint") != s.agent_endpoint or target.get("endpoint_overridden") is not True:
             raise Refused("The retained experiment does not confirm the selected endpoint.")
-    checked, _ = report.outcome(exp, result.get("compare"), None, compare_wanted=True, fail_on="regression")
+    task = result.get("task")
+    if s.task:
+        if (not isinstance(task, dict) or task.get("id") != s.task
+                or not task.get("agent_id") or task.get("agent_id") != exp.get("agent_id")
+                or not task.get("dataset_id") or task.get("dataset_id") != exp.get("dataset_id")):
+            raise Refused("The retained task does not bind the requested task, agent and dataset.")
+    elif task is not None or result.get("task_verdict") is not None:
+        raise Refused("The retained report contains an unrequested task gate.")
+    checked, _ = report.outcome(exp, result.get("compare"), None, compare_wanted=True, fail_on="regression",
+                                task_wanted=bool(s.task), task_verdict=result.get("task_verdict"))
     if checked != code:
         raise Refused("Missing, incomplete or conflicting evidence cannot pass the regression gate.")
     if result.get("verdict") != (result.get("compare") or {}).get("verdict"):
@@ -186,8 +226,10 @@ def execute(s: Settings, private: Path) -> tuple[int, dict]:
     env.update(AQ_API_KEY=s.api_key, AQ_ENDPOINT=s.endpoint, AQ_UI_URL=s.ui_url)
     args = [sys.executable, "-I", "-m", "aq_sdk.cli", "eval", "run", "--dataset=" + s.dataset,
             "--target=" + s.target, "--agent-endpoint=" + s.agent_endpoint, "--commit=" + s.commit,
-            "--compare-to=current", "--fail-on=regression", "--row-scope=development", "--budget=" + s.budget,
+            "--compare-to=current", "--fail-on=regression", "--row-scope=" + ("held_out" if s.task else "development"), "--budget=" + s.budget,
             "--timeout=" + str(s.timeout), "--report-file=/dev/null", "--json"]
+    if s.task:
+        args.append("--task=" + s.task)
     # The public report is written only after the known-secret checks below.
     # Capture privately in memory, never stream raw stdout/stderr to the runner log.
     completed = subprocess.run(args, cwd=private, env=env, capture_output=True, text=True, check=False)
@@ -214,6 +256,11 @@ def run(s: Settings, output: Path, *, evaluate: Callable = execute, publish: Cal
             code, result = evaluate(s, private)  # Exactly one CLI invocation. No replacement submission.
         validate_result(result, code, s)
         aggregate = aggregate_result(result)
+        aggregate_code, _ = report.outcome(aggregate["experiment"], aggregate.get("compare"), None,
+                                           compare_wanted=True, fail_on="regression", task_wanted=bool(s.task),
+                                           task_verdict=aggregate.get("task_verdict"))
+        if aggregate_code != code:
+            raise Refused("The aggregate does not preserve the requested outcome gate.")
         body = public_body(aggregate, s)
         (output / "aggregate-result.json").write_text(json.dumps(aggregate, indent=2) + "\n")
         (output / "evaluation.md").write_text(body)
